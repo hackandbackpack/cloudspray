@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ class StateDB:
     """SQLite-backed state store for spray progress, results, and tokens.
 
     Thread-safe and supports resume by tracking every attempt made.
+    Can be used as a context manager for automatic cleanup.
     """
 
     def __init__(self, db_path: str | Path):
@@ -26,7 +28,14 @@ class StateDB:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._lock = threading.Lock()
         self._create_tables()
+
+    def __enter__(self) -> "StateDB":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     def _create_tables(self) -> None:
         with self._transaction() as cursor:
@@ -93,13 +102,14 @@ class StateDB:
 
     @contextmanager
     def _transaction(self):
-        cursor = self._conn.cursor()
-        try:
-            yield cursor
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        with self._lock:
+            cursor = self._conn.cursor()
+            try:
+                yield cursor
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     # -- Recording methods --
 
@@ -150,7 +160,7 @@ class StateDB:
                     token.id_token,
                     token.client_id,
                     token.resource,
-                    token.expires_at.isoformat(),
+                    token.expires_at.isoformat() if token.expires_at else "",
                     1 if token.is_foci else 0,
                 ),
             )
@@ -223,7 +233,11 @@ class StateDB:
                 id_token=row["id_token"],
                 client_id=row["client_id"],
                 resource=row["resource"],
-                expires_at=datetime.fromisoformat(row["expires_at"]),
+                expires_at=(
+                    datetime.fromisoformat(row["expires_at"])
+                    if row["expires_at"]
+                    else None
+                ),
                 is_foci=bool(row["is_foci"]),
             )
             for row in cursor.fetchall()
