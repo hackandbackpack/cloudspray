@@ -73,7 +73,11 @@ class TokenManager:
         minted_tokens: list[Token] = []
         tenant_slug = self._domain.split(".")[0]
 
+        seen_client_ids: set[str] = set()
         for client_name, client_id in FOCI_CLIENT_IDS.items():
+            if client_id in seen_client_ids:
+                continue
+            seen_client_ids.add(client_id)
             for endpoint_name, endpoint_url in ENDPOINTS.items():
                 resource_url = endpoint_url.replace("{tenant}", tenant_slug)
                 scope = [f"{resource_url}/.default"]

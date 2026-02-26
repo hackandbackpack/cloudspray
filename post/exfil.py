@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 
 import requests
 
@@ -22,19 +23,37 @@ class GraphExfil:
     def __init__(self, db: StateDB, reporter: ConsoleReporter):
         self._db = db
         self._reporter = reporter
+        self._session = requests.Session()
+
+    def close(self) -> None:
+        """Close the underlying HTTP session."""
+        self._session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def _get_graph_token(self, username: str) -> str | None:
         """Get a Graph API access token for the user from the DB.
 
         Looks for tokens where the resource contains 'graph.microsoft.com'.
+        Skips tokens that have already expired.
         Returns the token string or None if not found.
         """
+        now = datetime.now(timezone.utc)
         tokens = self._db.get_tokens()
         for token in tokens:
             if token.username != username:
                 continue
-            if "graph.microsoft.com" in token.resource:
-                return token.access_token
+            if "graph.microsoft.com" not in token.resource:
+                continue
+            if token.expires_at is not None and token.expires_at <= now:
+                logger.debug("Skipping expired token for %s", username)
+                continue
+            return token.access_token
         return None
 
     def _graph_get(self, access_token: str, path: str) -> dict | None:
@@ -49,7 +68,7 @@ class GraphExfil:
         }
 
         try:
-            response = requests.get(url, headers=headers, timeout=30)
+            response = self._session.get(url, headers=headers, timeout=30)
         except requests.RequestException as exc:
             self._reporter.error(f"Graph API request failed: {exc}")
             return None

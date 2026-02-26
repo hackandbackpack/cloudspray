@@ -61,6 +61,7 @@ class JSONReporter:
                     "client_id": tok.client_id,
                     "resource": tok.resource,
                     "is_foci": tok.is_foci,
+                    "expires_at": tok.expires_at.isoformat() if tok.expires_at else None,
                 }
                 for tok in tokens
             ],

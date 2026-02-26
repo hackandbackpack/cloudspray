@@ -1,7 +1,9 @@
 import logging
+import random
 import time
 
 import msal
+import requests
 from rich.table import Table
 from rich.text import Text
 
@@ -25,9 +27,9 @@ PROBE_DELAY_SECONDS = 0.5
 class CAProbe:
     """Probe for gaps in Conditional Access policies.
 
-    For valid credentials blocked by MFA or CA, tests every combination of:
-    client_id x endpoint x user_agent
-    to find paths that bypass CA restrictions.
+    For valid credentials blocked by MFA or CA, tests every combination of
+    client_id x endpoint to find paths that bypass CA restrictions.
+    A random user agent is selected per attempt to reduce fingerprinting.
 
     Similar to MFASweep's approach.
     """
@@ -47,21 +49,26 @@ class CAProbe:
         """
         bypasses: list[dict] = []
         tenant_slug = self._domain.split(".")[0]
-        user_agent = USER_AGENTS[0]
 
         total_combos = len(ALL_CLIENT_IDS) * len(ENDPOINTS)
         self._reporter.info(
             f"Probing CA for {username}: {total_combos} combinations"
         )
 
+        http_session = requests.Session()
+
         for client_name, client_id in ALL_CLIENT_IDS.items():
             for endpoint_name, endpoint_url in ENDPOINTS.items():
                 resource_url = endpoint_url.replace("{tenant}", tenant_slug)
                 scope = [f"{resource_url}/.default"]
 
+                user_agent = random.choice(USER_AGENTS)
+                http_session.headers["User-Agent"] = user_agent
+
                 app = msal.PublicClientApplication(
                     client_id,
                     authority=self._authority,
+                    http_client=http_session,
                 )
 
                 try:
@@ -92,6 +99,8 @@ class CAProbe:
                     )
 
                 time.sleep(PROBE_DELAY_SECONDS)
+
+        http_session.close()
 
         self._reporter.info(
             f"CA probe for {username}: {len(bypasses)} bypass(es) found"
