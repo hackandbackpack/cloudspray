@@ -20,9 +20,10 @@ class Authenticator:
         """
         self._domain = domain
         self._authority = f"https://login.microsoftonline.com/{domain}"
-        self._proxy_session = proxy_session
+        self._http_client = proxy_session or requests.Session()
         self._client_ids = list(ALL_CLIENT_IDS.values())
         self._endpoints = list(ENDPOINTS.values())
+        self._app_cache: dict[str, msal.PublicClientApplication] = {}
 
     def attempt(self, username: str, password: str) -> SprayAttempt:
         """Perform a single ROPC authentication attempt.
@@ -43,20 +44,19 @@ class Authenticator:
         scope = [f"{scope_resource}/.default"]
 
         proxy_url = ""
-        http_client = self._proxy_session
-        if http_client is None:
-            http_client = requests.Session()
-        else:
-            # Track which proxy we used for logging
-            proxy_url = (http_client.proxies or {}).get("https", "")
+        proxies = self._http_client.proxies or {}
+        if proxies:
+            proxy_url = proxies.get("https", "")
 
-        http_client.headers["User-Agent"] = user_agent
+        self._http_client.headers["User-Agent"] = user_agent
 
-        app = msal.PublicClientApplication(
-            client_id,
-            authority=self._authority,
-            http_client=http_client,
-        )
+        if client_id not in self._app_cache:
+            self._app_cache[client_id] = msal.PublicClientApplication(
+                client_id,
+                authority=self._authority,
+                http_client=self._http_client,
+            )
+        app = self._app_cache[client_id]
 
         auth_result = None
         auth_error = None

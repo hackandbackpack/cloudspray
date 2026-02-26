@@ -9,7 +9,7 @@ from cloudspray.reporting.console import ConsoleReporter
 from cloudspray.spray.auth import Authenticator
 from cloudspray.spray.shuffle import aggressive_shuffle, standard_shuffle
 from cloudspray.state.db import StateDB
-from cloudspray.state.models import LockedAccount, ValidCredential
+from cloudspray.state.models import LockedAccount, SprayAttempt, ValidCredential
 
 # AuthResult values that indicate the password is correct
 _VALID_PASSWORD_RESULTS = {
@@ -47,6 +47,10 @@ class SprayEngine:
         Generates credential pairs, filters already-attempted ones for resume,
         enforces per-user delay, detects lockouts, and handles rate limiting.
         """
+        if not users or not passwords:
+            self._reporter.error("No users or passwords provided.")
+            return
+
         pairs = self._build_pairs(users, passwords)
         total_generated = len(pairs)
 
@@ -84,10 +88,15 @@ class SprayEngine:
 
                 attempt = self._auth.attempt(username, password)
                 self._last_attempt_per_user[username] = attempt.timestamp
-                self._db.record_attempt(attempt)
                 self._reporter.print_result(attempt)
 
                 self._handle_result(attempt, queue)
+
+                # Only persist after handling -- rate-limited attempts get
+                # requeued and must not be marked as "already attempted" on
+                # crash+resume, otherwise they'd be skipped permanently.
+                if attempt.result != AuthResult.RATE_LIMITED:
+                    self._db.record_attempt(attempt)
                 self._reporter.update_progress(progress, task_id)
 
                 if self._check_lockout_threshold():
@@ -126,7 +135,7 @@ class SprayEngine:
             time.sleep(remaining_wait)
 
     def _handle_result(
-        self, attempt, queue: deque[tuple[str, str]]
+        self, attempt: SprayAttempt, queue: deque[tuple[str, str]]
     ) -> None:
         """Process an attempt result: record credentials, lockouts, or requeue."""
         result = attempt.result
