@@ -4,6 +4,7 @@ from rich.progress import (
     MofNCompleteColumn,
     Progress,
     SpinnerColumn,
+    TaskID,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
@@ -42,7 +43,7 @@ class ConsoleReporter:
             "[dim]Azure AD Password Sprayer & Enumerator[/dim]\n"
         )
 
-    def start_spray(self, total_attempts: int) -> Progress:
+    def start_spray(self, total_attempts: int) -> tuple[Progress, TaskID]:
         """Create and start a Rich progress bar for spray operations."""
         progress = Progress(
             SpinnerColumn(),
@@ -54,9 +55,10 @@ class ConsoleReporter:
             console=self.console,
         )
         progress.start()
-        return progress
+        task_id = progress.add_task("Spraying...", total=total_attempts)
+        return progress, task_id
 
-    def update_progress(self, progress: Progress, task_id, advance: int = 1) -> None:
+    def update_progress(self, progress: Progress, task_id: TaskID, advance: int = 1) -> None:
         """Advance a progress bar task."""
         progress.update(task_id, advance=advance)
 

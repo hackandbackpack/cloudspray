@@ -132,10 +132,10 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
     mutually_exclusive=["passwords"],
     help="Single password string.",
 )
-@click.option("--delay", type=int, default=None, help="Seconds between attempts per user.")
-@click.option("--jitter", type=int, default=None, help="Random jitter range in seconds.")
-@click.option("--lockout-threshold", type=int, default=None, help="Pause after N lockouts.")
-@click.option("--lockout-pause", type=int, default=None, help="Pause duration in seconds on lockout.")
+@click.option("--delay", type=click.IntRange(min=0), default=None, help="Seconds between attempts per user.")
+@click.option("--jitter", type=click.IntRange(min=0), default=None, help="Random jitter range in seconds.")
+@click.option("--lockout-threshold", type=click.IntRange(min=1), default=None, help="Pause after N lockouts.")
+@click.option("--lockout-pause", type=click.IntRange(min=0), default=None, help="Pause duration in seconds on lockout.")
 @click.option(
     "--shuffle",
     type=click.Choice(["standard", "aggressive"], case_sensitive=False),

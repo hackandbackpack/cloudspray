@@ -1,7 +1,11 @@
+import dataclasses
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -98,42 +102,19 @@ def _merge_dict(defaults: dict, overrides: dict) -> dict:
 
 def _defaults_dict() -> dict:
     """Return the full config structure as a plain dict with all defaults."""
-    config = CloudSprayConfig()
-    return {
-        "target": {"domain": config.target.domain},
-        "spray": {
-            "delay": config.spray.delay,
-            "jitter": config.spray.jitter,
-            "lockout_threshold": config.spray.lockout_threshold,
-            "lockout_pause": config.spray.lockout_pause,
-            "shuffle_mode": config.spray.shuffle_mode,
-        },
-        "proxy": {
-            "aws_gateway": {
-                "enabled": config.proxy.aws_gateway.enabled,
-                "access_key": config.proxy.aws_gateway.access_key,
-                "secret_key": config.proxy.aws_gateway.secret_key,
-                "regions": list(config.proxy.aws_gateway.regions),
-            },
-            "azure_aci": {
-                "enabled": config.proxy.azure_aci.enabled,
-                "subscription_id": config.proxy.azure_aci.subscription_id,
-                "client_id": config.proxy.azure_aci.client_id,
-                "client_secret": config.proxy.azure_aci.client_secret,
-                "tenant_id": config.proxy.azure_aci.tenant_id,
-                "regions": list(config.proxy.azure_aci.regions),
-                "container_count": config.proxy.azure_aci.container_count,
-            },
-            "proxy_list": {
-                "enabled": config.proxy.proxy_list.enabled,
-                "file": config.proxy.proxy_list.file,
-            },
-        },
-        "enum": {
-            "teams_user": config.enum.teams_user,
-            "teams_pass": config.enum.teams_pass,
-        },
-    }
+    return dataclasses.asdict(CloudSprayConfig())
+
+
+def _filter_fields(cls: type, data: dict) -> dict:
+    """Keep only keys that match known dataclass fields, warn about extras."""
+    known = {f.name for f in dataclasses.fields(cls)}
+    filtered = {}
+    for key, value in data.items():
+        if key in known:
+            filtered[key] = value
+        else:
+            logger.warning("Ignoring unknown config key '%s' for %s", key, cls.__name__)
+    return filtered
 
 
 def _build_config(data: dict) -> CloudSprayConfig:
@@ -148,14 +129,14 @@ def _build_config(data: dict) -> CloudSprayConfig:
     plist_data = proxy_data.get("proxy_list", {})
 
     return CloudSprayConfig(
-        target=TargetConfig(**target_data),
-        spray=SprayConfig(**spray_data),
+        target=TargetConfig(**_filter_fields(TargetConfig, target_data)),
+        spray=SprayConfig(**_filter_fields(SprayConfig, spray_data)),
         proxy=ProxyConfig(
-            aws_gateway=AWSGatewayConfig(**aws_data),
-            azure_aci=AzureACIConfig(**aci_data),
-            proxy_list=ProxyListConfig(**plist_data),
+            aws_gateway=AWSGatewayConfig(**_filter_fields(AWSGatewayConfig, aws_data)),
+            azure_aci=AzureACIConfig(**_filter_fields(AzureACIConfig, aci_data)),
+            proxy_list=ProxyListConfig(**_filter_fields(ProxyListConfig, plist_data)),
         ),
-        enum=EnumConfig(**enum_data),
+        enum=EnumConfig(**_filter_fields(EnumConfig, enum_data)),
     )
 
 
@@ -198,7 +179,9 @@ def load_config(path: str | None = None) -> CloudSprayConfig:
     defaults = _defaults_dict()
 
     if path is None:
-        return _build_config(defaults)
+        config = _build_config(defaults)
+        _validate(config)
+        return config
 
     config_path = Path(path)
     if not config_path.is_file():
