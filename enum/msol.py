@@ -14,6 +14,7 @@ from cloudspray.constants import USER_AGENTS
 from cloudspray.reporting.console import ConsoleReporter
 from cloudspray.state.db import StateDB
 from cloudspray.state.models import EnumResult
+from cloudspray.utils import normalize_email
 
 METHOD_NAME = "msol"
 
@@ -125,22 +126,23 @@ class MSOLEnumerator:
             List of confirmed existing users.
         """
         confirmed: list[str] = []
+        usernames = list(dict.fromkeys(usernames))  # preserve order, remove dupes
 
         for username in usernames:
-            email = username if "@" in username else f"{username}@{self._domain}"
+            email = normalize_email(username, self._domain)
             check_result = self._check_user(email)
 
             if check_result is None:
-                exists = False
-            else:
-                exists = check_result
+                self._reporter.debug(f"Skipping ambiguous result for {email}")
+                time.sleep(random.uniform(1.0, 3.0))
+                continue
 
-            if exists:
+            if check_result:
                 confirmed.append(email)
 
-            result = EnumResult(username=email, method=METHOD_NAME, exists=exists)
+            result = EnumResult(username=email, method=METHOD_NAME, exists=check_result)
             self._db.record_enum_result(result)
-            self._reporter.print_enum_result(email, exists, METHOD_NAME)
+            self._reporter.print_enum_result(email, check_result, METHOD_NAME)
 
             # Longer delay due to rate limiting sensitivity
             time.sleep(random.uniform(1.0, 3.0))

@@ -9,9 +9,11 @@ import time
 
 import requests
 
+from cloudspray.constants import USER_AGENTS
 from cloudspray.reporting.console import ConsoleReporter
 from cloudspray.state.db import StateDB
 from cloudspray.state.models import EnumResult
+from cloudspray.utils import normalize_email
 
 METHOD_NAME = "onedrive"
 
@@ -64,14 +66,16 @@ class OneDriveEnumerator:
             List of confirmed existing users.
         """
         confirmed: list[str] = []
+        usernames = list(dict.fromkeys(usernames))  # preserve order, remove dupes
 
         for username in usernames:
-            email = username if "@" in username else f"{username}@{self._domain}"
+            email = normalize_email(username, self._domain)
             url = self._build_url(email)
             exists = False
 
             try:
-                response = self._session.head(url, timeout=10, allow_redirects=True)
+                headers = {"User-Agent": random.choice(USER_AGENTS)}
+                response = self._session.head(url, timeout=10, allow_redirects=True, headers=headers)
                 status = response.status_code
 
                 if status == 403:

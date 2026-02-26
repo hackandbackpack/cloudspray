@@ -5,6 +5,7 @@ Uses the Teams user search endpoint to determine if target users exist.
 """
 
 import random
+import re
 import time
 
 import msal
@@ -14,6 +15,7 @@ from cloudspray.constants import USER_AGENTS
 from cloudspray.reporting.console import ConsoleReporter
 from cloudspray.state.db import StateDB
 from cloudspray.state.models import EnumResult
+from cloudspray.utils import normalize_email
 
 METHOD_NAME = "teams"
 
@@ -23,9 +25,10 @@ TEAMS_CLIENT_ID = "1fec8e78-bce4-4aaf-ab1b-5451cc387264"
 # Teams Skype API scope for token acquisition
 TEAMS_SCOPE = ["https://api.spaces.skype.com/.default"]
 
-# Teams user search endpoint
-TEAMS_SEARCH_URL = (
-    "https://teams.microsoft.com/api/mt/part/emea-02/beta/users/searchV2"
+# Teams user search endpoint pattern.
+# Common region slugs: "amer-01", "apac-01", "emea-02"
+TEAMS_SEARCH_URL_TEMPLATE = (
+    "https://teams.microsoft.com/api/mt/part/{region}/beta/users/searchV2"
 )
 
 
@@ -49,6 +52,7 @@ class TeamsEnumerator:
         auth_user: str,
         auth_pass: str,
         proxy_session: requests.Session | None = None,
+        region: str = "emea-02",
     ):
         self._domain = domain
         self._db = db
@@ -57,6 +61,8 @@ class TeamsEnumerator:
         self._auth_pass = auth_pass
         self._session = proxy_session or requests.Session()
         self._access_token: str | None = None
+        self._access_blocked = False
+        self._search_url = TEAMS_SEARCH_URL_TEMPLATE.format(region=region)
 
     def _authenticate(self) -> bool:
         """Authenticate the sacrificial account and obtain a Teams token.
@@ -83,8 +89,11 @@ class TeamsEnumerator:
             self._access_token = result["access_token"]
             return True
 
-        error_desc = result.get("error_description", "unknown error") if result else "no response"
-        self._reporter.error(f"Teams auth failed for sacrificial account: {error_desc}")
+        raw_desc = result.get("error_description", "unknown error") if result else "no response"
+        # Only surface the AADSTS error code, not the full description
+        code_match = re.search(r"AADSTS\d+", raw_desc)
+        sanitized = code_match.group(0) if code_match else "authentication failed"
+        self._reporter.error(f"Teams authentication failed: {sanitized}")
         return False
 
     def _search_user(self, email: str) -> bool | None:
@@ -106,7 +115,7 @@ class TeamsEnumerator:
 
         try:
             response = self._session.post(
-                TEAMS_SEARCH_URL,
+                self._search_url,
                 json=payload,
                 headers=headers,
                 timeout=15,
@@ -116,6 +125,7 @@ class TeamsEnumerator:
             return None
 
         if response.status_code == 403:
+            self._access_blocked = True
             self._reporter.error(
                 "External access blocked by tenant policy. Teams enumeration unavailable."
             )
@@ -155,23 +165,27 @@ class TeamsEnumerator:
 
         self._reporter.info("Teams authentication successful, beginning enumeration.")
         confirmed: list[str] = []
+        usernames = list(dict.fromkeys(usernames))  # preserve order, remove dupes
 
         for username in usernames:
-            email = username if "@" in username else f"{username}@{self._domain}"
+            if self._access_blocked:
+                self._reporter.error("Stopping enumeration: tenant blocked external access.")
+                break
+
+            email = normalize_email(username, self._domain)
             search_result = self._search_user(email)
 
             if search_result is None:
-                # Ambiguous result
-                exists = False
-            else:
-                exists = search_result
+                self._reporter.debug(f"Skipping ambiguous result for {email}")
+                time.sleep(random.uniform(0.5, 2.0))
+                continue
 
-            if exists:
+            if search_result:
                 confirmed.append(email)
 
-            result = EnumResult(username=email, method=METHOD_NAME, exists=exists)
+            result = EnumResult(username=email, method=METHOD_NAME, exists=search_result)
             self._db.record_enum_result(result)
-            self._reporter.print_enum_result(email, exists, METHOD_NAME)
+            self._reporter.print_enum_result(email, search_result, METHOD_NAME)
 
             time.sleep(random.uniform(0.5, 2.0))
 

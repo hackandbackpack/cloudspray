@@ -61,6 +61,17 @@ def read_lines(filepath: str | Path, *, skip_comments: bool = True) -> list[str]
     return lines
 
 
+def normalize_email(username: str, domain: str) -> str:
+    """Ensure a username is a fully-qualified email address.
+
+    If the username already contains '@', it is returned as-is.
+    Otherwise, the domain is appended.
+    """
+    if "@" in username:
+        return username
+    return f"{username}@{domain}"
+
+
 def read_userlist(filepath: str | Path) -> list[str]:
     """Read a list of usernames/emails from a file, one per line."""
     return read_lines(filepath)

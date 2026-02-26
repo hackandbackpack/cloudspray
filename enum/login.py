@@ -9,11 +9,14 @@ import random
 import time
 import uuid
 
+import requests
+
 from cloudspray.constants.error_codes import AuthResult
 from cloudspray.reporting.console import ConsoleReporter
 from cloudspray.spray.auth import Authenticator
 from cloudspray.state.db import StateDB
 from cloudspray.state.models import EnumResult
+from cloudspray.utils import normalize_email
 
 METHOD_NAME = "login"
 
@@ -51,7 +54,7 @@ class LoginEnumerator:
         domain: str,
         db: StateDB,
         reporter: ConsoleReporter,
-        proxy_session=None,
+        proxy_session: requests.Session | None = None,
     ):
         self._domain = domain
         self._db = db
@@ -81,9 +84,10 @@ class LoginEnumerator:
             List of confirmed existing users.
         """
         confirmed: list[str] = []
+        usernames = list(dict.fromkeys(usernames))  # preserve order, remove dupes
 
         for username in usernames:
-            email = username if "@" in username else f"{username}@{self._domain}"
+            email = normalize_email(username, self._domain)
 
             # Use a random UUID as the password so it is guaranteed wrong
             fake_password = str(uuid.uuid4())
