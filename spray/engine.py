@@ -41,11 +41,12 @@ class SprayEngine:
         self._confirmed_users: set[str] = set()
         self._lockout_count = 0
 
-    def run(self, users: list[str], passwords: list[str]) -> None:
+    def run(self, users: list[str], passwords: list[str], resume: bool = True) -> None:
         """Execute the spray campaign.
 
-        Generates credential pairs, filters already-attempted ones for resume,
-        enforces per-user delay, detects lockouts, and handles rate limiting.
+        Generates credential pairs, optionally filters already-attempted ones
+        when resuming, enforces per-user delay, detects lockouts, and handles
+        rate limiting.
         """
         if not users or not passwords:
             self._reporter.error("No users or passwords provided.")
@@ -55,13 +56,14 @@ class SprayEngine:
         total_generated = len(pairs)
 
         # Resume support: drop pairs we already tried
-        attempted = self._db.get_attempted_pairs()
-        if attempted:
-            pairs = [(u, p) for u, p in pairs if (u, p) not in attempted]
-            self._reporter.info(
-                f"Resuming: {total_generated - len(pairs)} already attempted, "
-                f"{len(pairs)} remaining"
-            )
+        if resume:
+            attempted = self._db.get_attempted_pairs()
+            if attempted:
+                pairs = [(u, p) for u, p in pairs if (u, p) not in attempted]
+                self._reporter.info(
+                    f"Resuming: {total_generated - len(pairs)} already attempted, "
+                    f"{len(pairs)} remaining"
+                )
 
         # Pre-load users that already have confirmed creds so we skip them
         for cred in self._db.get_valid_credentials():

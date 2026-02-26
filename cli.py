@@ -107,36 +107,42 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
 
     userlist = read_userlist(users)
 
-    with StateDB(ctx.obj["db_path"]) as db:
-        reporter.info(f"Enumeration starting: domain={domain}, method={method}")
-        reporter.info(f"User list: {users} ({len(userlist)} entries)")
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            reporter.info(f"Enumeration starting: domain={domain}, method={method}")
+            reporter.info(f"User list: {users} ({len(userlist)} entries)")
 
-        if method == "onedrive":
-            enumerator = OneDriveEnumerator(domain, db, reporter)
-            valid = enumerator.enumerate(userlist)
-        elif method == "teams":
-            enumerator = TeamsEnumerator(
-                domain, db, reporter,
-                auth_user=cfg.enum.teams_user,
-                auth_pass=cfg.enum.teams_pass,
-            )
-            valid = enumerator.enumerate(userlist)
-        elif method == "msol":
-            enumerator = MSOLEnumerator(domain, db, reporter)
-            valid = enumerator.enumerate(userlist)
-        elif method == "login":
-            enumerator = LoginEnumerator(domain, db, reporter)
-            valid = enumerator.enumerate(userlist)
-        else:
-            reporter.error(f"Unknown enumeration method: {method}")
-            return
+            if method == "onedrive":
+                enumerator = OneDriveEnumerator(domain, db, reporter)
+                valid = enumerator.enumerate(userlist)
+            elif method == "teams":
+                enumerator = TeamsEnumerator(
+                    domain, db, reporter,
+                    auth_user=cfg.enum.teams_user,
+                    auth_pass=cfg.enum.teams_pass,
+                )
+                valid = enumerator.enumerate(userlist)
+            elif method == "msol":
+                enumerator = MSOLEnumerator(domain, db, reporter)
+                valid = enumerator.enumerate(userlist)
+            elif method == "login":
+                enumerator = LoginEnumerator(domain, db, reporter)
+                valid = enumerator.enumerate(userlist)
+            else:
+                reporter.error(f"Unknown enumeration method: {method}")
+                return
 
-        if output:
-            with open(output, "w") as f:
-                f.write("\n".join(valid) + "\n")
-            reporter.info(f"Valid users written to {output}")
+            if output:
+                with open(output, "w", encoding="utf-8") as f:
+                    f.write("\n".join(valid) + "\n")
+                reporter.info(f"Valid users written to {output}")
 
-        reporter.info(f"Enumeration complete: {len(valid)} valid users found")
+            reporter.info(f"Enumeration complete: {len(valid)} valid users found")
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Enumeration failed: {exc}")
+        raise SystemExit(1) from exc
 
 
 @cli.command("spray")
@@ -207,20 +213,22 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
     else:
         passlist = [password]
 
-    with StateDB(ctx.obj["db_path"]) as db:
-        reporter.info(f"Spray engine starting: domain={domain}")
-        reporter.info(f"User list: {users} ({len(userlist)} entries)")
-        reporter.info(
-            f"Delay={cfg.spray.delay}s, Jitter={cfg.spray.jitter}s, "
-            f"Shuffle={cfg.spray.shuffle_mode}"
-        )
-        if resume:
-            attempted = db.get_attempted_pairs()
-            reporter.info(f"Resuming: {len(attempted)} attempts already recorded.")
-
-        authenticator = Authenticator(cfg.target.domain)
-        engine = SprayEngine(cfg, db, authenticator, reporter)
-        engine.run(userlist, passlist)
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            reporter.info(f"Spray engine starting: domain={domain}")
+            reporter.info(f"User list: {users} ({len(userlist)} entries)")
+            reporter.info(
+                f"Delay={cfg.spray.delay}s, Jitter={cfg.spray.jitter}s, "
+                f"Shuffle={cfg.spray.shuffle_mode}"
+            )
+            authenticator = Authenticator(cfg.target.domain)
+            engine = SprayEngine(cfg, db, authenticator, reporter)
+            engine.run(userlist, passlist, resume=resume)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Spray failed: {exc}")
+        raise SystemExit(1) from exc
 
 
 @cli.command("post")
@@ -243,34 +251,40 @@ def post_cmd(ctx, foci, ca_probe, exfil, user):
 
     cfg = ctx.obj["config"]
 
-    with StateDB(ctx.obj["db_path"]) as db:
-        creds = db.get_valid_credentials()
-        if not creds:
-            reporter.error("No valid credentials in database. Run 'spray' first.")
-            raise SystemExit(1)
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            creds = db.get_valid_credentials()
+            if not creds:
+                reporter.error("No valid credentials in database. Run 'spray' first.")
+                raise SystemExit(1)
 
-        reporter.info(f"Post-exploitation: {len(creds)} valid credential(s) available.")
-        if user:
-            reporter.info(f"Targeting user: {user}")
+            reporter.info(f"Post-exploitation: {len(creds)} valid credential(s) available.")
+            if user:
+                reporter.info(f"Targeting user: {user}")
 
-        if foci:
-            token_mgr = TokenManager(cfg.target.domain, db, reporter)
-            results = token_mgr.exchange_all_valid_credentials()
-            for username, tokens in results.items():
-                reporter.info(f"  {username}: {len(tokens)} tokens captured")
+            if foci:
+                token_mgr = TokenManager(cfg.target.domain, db, reporter)
+                results = token_mgr.exchange_all_valid_credentials()
+                for username, tokens in results.items():
+                    reporter.info(f"  {username}: {len(tokens)} tokens captured")
 
-        if ca_probe:
-            prober = CAProbe(cfg.target.domain, db, reporter)
-            probe_results = prober.probe_all_blocked()
-            prober.print_matrix(probe_results)
+            if ca_probe:
+                prober = CAProbe(cfg.target.domain, db, reporter)
+                probe_results = prober.probe_all_blocked()
+                prober.print_matrix(probe_results)
 
-        if exfil:
-            with GraphExfil(db, reporter) as exfiltrator:
-                if user:
-                    exfiltrator.run_all(user)
-                else:
-                    for cred in db.get_valid_credentials():
-                        exfiltrator.run_all(cred.username)
+            if exfil:
+                with GraphExfil(db, reporter) as exfiltrator:
+                    if user:
+                        exfiltrator.run_all(user)
+                    else:
+                        for cred in creds:
+                            exfiltrator.run_all(cred.username)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Post-exploitation failed: {exc}")
+        raise SystemExit(1) from exc
 
 
 @cli.command("report")
@@ -296,16 +310,22 @@ def report_cmd(ctx, output_format, output):
 
     from cloudspray.reporting import JSONReporter, CSVReporter
 
-    with StateDB(ctx.obj["db_path"]) as db:
-        reporter.info(f"Generating {output_format.upper()} report: {output}")
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            reporter.info(f"Generating {output_format.upper()} report: {output}")
 
-        if output_format == "json":
-            report_writer = JSONReporter(db)
-        elif output_format == "csv":
-            report_writer = CSVReporter(db)
-        else:
-            reporter.error(f"Unknown report format: {output_format}")
-            return
+            if output_format == "json":
+                report_writer = JSONReporter(db)
+            elif output_format == "csv":
+                report_writer = CSVReporter(db)
+            else:
+                reporter.error(f"Unknown report format: {output_format}")
+                return
 
-        report_writer.generate(output)
-        reporter.info(f"Report written to {output}")
+            report_writer.generate(output)
+            reporter.info(f"Report written to {output}")
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Report generation failed: {exc}")
+        raise SystemExit(1) from exc
