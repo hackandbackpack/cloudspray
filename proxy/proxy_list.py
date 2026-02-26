@@ -71,20 +71,31 @@ class ProxyListProvider(ProxyProvider):
         """No-op -- nothing to clean up for a static proxy list."""
 
     def health_check(self) -> bool:
-        """Test connectivity through the first proxy in the list."""
+        """Test connectivity through all proxies against the actual target.
+
+        Returns False if any proxy fails, since a dead proxy in the rotation
+        would cause intermittent failures during operation.
+        """
         if not self._proxies:
             return False
 
-        test_proxy = self._proxies[0]
-        proxy_dict = {"http": test_proxy, "https": test_proxy}
+        for proxy_url in self._proxies:
+            proxy_dict = {"http": proxy_url, "https": proxy_url}
+            try:
+                resp = requests.get(
+                    "https://login.microsoftonline.com",
+                    proxies=proxy_dict,
+                    timeout=10,
+                )
+                if resp.status_code >= 500:
+                    logger.warning(
+                        "Health check returned HTTP %d for proxy: %s",
+                        resp.status_code,
+                        proxy_url,
+                    )
+                    return False
+            except requests.RequestException:
+                logger.warning("Health check failed for proxy: %s", proxy_url)
+                return False
 
-        try:
-            resp = requests.get(
-                "https://httpbin.org/ip",
-                proxies=proxy_dict,
-                timeout=10,
-            )
-            return resp.status_code == 200
-        except requests.RequestException:
-            logger.warning("Health check failed for proxy: %s", test_proxy)
-            return False
+        return True

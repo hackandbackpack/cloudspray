@@ -1,10 +1,9 @@
 import logging
-import random
-import string
 
 import requests
 
 from cloudspray.proxy.base import ProxyProvider
+from cloudspray.utils import random_suffix
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +19,6 @@ def _require_boto3():
             "boto3 is required for AWS API Gateway proxy support. "
             "Install it with: pip install boto3"
         ) from None
-
-
-def _random_suffix(length: int = 8) -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
 class AWSGatewayProvider(ProxyProvider):
@@ -73,7 +68,7 @@ class AWSGatewayProvider(ProxyProvider):
                 aws_access_key_id=self._access_key,
                 aws_secret_access_key=self._secret_key,
             )
-            api_name = f"cloudspray-{region}-{_random_suffix()}"
+            api_name = f"cloudspray-{region}-{random_suffix()}"
 
             try:
                 api_response = client.create_rest_api(
@@ -82,6 +77,9 @@ class AWSGatewayProvider(ProxyProvider):
                     endpointConfiguration={"types": ["REGIONAL"]},
                 )
                 api_id = api_response["id"]
+
+                # Track immediately so teardown can clean up on later failures
+                self._api_ids.append((region, api_id))
 
                 # Get root resource ID
                 resources = client.get_resources(restApiId=api_id)
@@ -124,7 +122,6 @@ class AWSGatewayProvider(ProxyProvider):
                     f"https://{api_id}.execute-api.{region}.amazonaws.com/proxy"
                 )
                 self._gateway_urls.append(invoke_url)
-                self._api_ids.append((region, api_id))
                 logger.info("Created API Gateway %s in %s", api_id, region)
 
             except Exception:

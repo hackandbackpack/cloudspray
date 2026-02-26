@@ -1,9 +1,8 @@
 import logging
-import random
 import socket
-import string
 
 from cloudspray.proxy.base import ProxyProvider
+from cloudspray.utils import random_suffix
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +63,6 @@ def _require_azure_deps():
     }
 
 
-def _random_suffix(length: int = 8) -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
-
-
 class AzureACIProvider(ProxyProvider):
     """Azure Container Instances proxy -- each container has a unique public IP.
 
@@ -116,7 +111,7 @@ class AzureACIProvider(ProxyProvider):
         """
         deps = _require_azure_deps()
         credential = self._get_credential(deps)
-        suffix = _random_suffix()
+        suffix = random_suffix()
         self._resource_group = f"cloudspray-proxy-{suffix}"
 
         # Create the resource group in the first region
@@ -182,6 +177,11 @@ class AzureACIProvider(ProxyProvider):
                     )
 
         if not self._container_ips:
+            # Clean up the empty resource group before raising
+            try:
+                self.teardown()
+            except Exception:
+                logger.exception("Teardown failed during cleanup of empty deployment")
             raise RuntimeError(
                 "Failed to deploy any proxy containers. Check Azure credentials."
             )

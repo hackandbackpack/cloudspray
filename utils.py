@@ -1,4 +1,6 @@
 import logging
+import random
+import string
 from pathlib import Path
 
 from rich.logging import RichHandler
@@ -36,6 +38,11 @@ def setup_logging(level: str = "INFO", logfile: str | None = None) -> logging.Lo
         logger.addHandler(file_handler)
 
     return logger
+
+
+def random_suffix(length: int = 8) -> str:
+    """Generate a short random alphanumeric string for unique naming."""
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
 def read_lines(filepath: str | Path, *, skip_comments: bool = True) -> list[str]:
