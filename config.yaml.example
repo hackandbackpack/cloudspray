@@ -1,0 +1,57 @@
+# CloudSpray Configuration
+# Copy this file to config.yaml and fill in your values:
+#   cp config.yaml.example config.yaml
+#
+# Only uncomment and set the fields you need. Everything has sensible
+# defaults -- see the README for full documentation.
+
+# ── Target ───────────────────────────────────────────────────────────
+target:
+  domain: ""                     # Target M365 domain (e.g., contoso.com)
+
+# ── Spray Settings ───────────────────────────────────────────────────
+spray:
+  delay: 30                      # Seconds between attempts per user
+  jitter: 5                      # Random 0-N seconds added to delay
+  lockout_threshold: 10          # Consecutive lockouts before hard stop
+  lockout_cooldown: 1800         # Per-user cooldown after lockout (seconds)
+  shuffle_mode: standard         # "standard" or "aggressive"
+
+# ── Proxy (Fireprox) ────────────────────────────────────────────────
+# AWS API Gateway for IP rotation. Each request gets a different source
+# IP from AWS's pool, defeating IP-based rate limiting.
+#
+# Required IAM permissions: AmazonAPIGatewayAdministrator
+# (or custom: apigateway:POST, apigateway:GET, apigateway:DELETE)
+proxy:
+  aws_gateway:
+    enabled: false
+    access_key: ""               # AWS IAM access key ID
+    secret_key: ""               # AWS IAM secret access key
+    regions:                     # More regions = more IP diversity
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+
+  # Alternative: Azure Container Instance proxies
+  # azure_aci:
+  #   enabled: false
+  #   subscription_id: ""
+  #   client_id: ""
+  #   client_secret: ""
+  #   tenant_id: ""
+  #   regions:
+  #     - eastus
+  #     - westus2
+  #   container_count: 3
+
+  # Alternative: Static proxy list (one URL per line)
+  # proxy_list:
+  #   enabled: false
+  #   file: proxies.txt
+
+# ── Enumeration ──────────────────────────────────────────────────────
+# Only needed for the "teams" enum method (requires a valid M365 account)
+enum:
+  teams_user: ""                 # Sacrificial account email
+  teams_pass: ""                 # Sacrificial account password

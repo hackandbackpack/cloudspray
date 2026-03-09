@@ -97,19 +97,23 @@ python -m cloudspray spray -d example.com -u valid-users.txt -p passwords.txt
 Route all traffic through AWS API Gateway for IP rotation:
 
 ```bash
-# Create config with AWS credentials
-cat > config.yaml << 'EOF'
+# Copy the config template and fill in your AWS credentials
+cp config.yaml.example config.yaml
+```
+
+Edit `config.yaml` and set your AWS credentials under `proxy.aws_gateway`:
+
+```yaml
 proxy:
   aws_gateway:
     enabled: true
     access_key: "YOUR_AWS_ACCESS_KEY"
     secret_key: "YOUR_AWS_SECRET_KEY"
-    regions:
-      - us-east-1
-      - us-west-2
-      - eu-west-1
-EOF
+```
 
+Then run with the `-c` flag:
+
+```bash
 # Enum through Fireprox
 python -m cloudspray -c config.yaml enum -d example.com -u userlist.txt -m msol -o valid-users.txt
 
@@ -139,7 +143,13 @@ python -m cloudspray report -f csv -o results.csv
 
 ## Configuration
 
-CloudSpray uses YAML config files merged with built-in defaults. You only need to specify values you want to override.
+Copy the included template and edit it:
+
+```bash
+cp config.yaml.example config.yaml
+```
+
+CloudSpray merges your config with built-in defaults, so you only need to set the fields you care about. The template file has comments explaining every option.
 
 ### Full Config Reference
 
