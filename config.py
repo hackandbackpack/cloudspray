@@ -21,8 +21,8 @@ class SprayConfig:
 
     delay: int = 30
     jitter: int = 5
-    lockout_threshold: int = 5
-    lockout_pause: int = 900
+    lockout_threshold: int = 10
+    lockout_cooldown: int = 1800
     shuffle_mode: str = "standard"
 
 
@@ -159,9 +159,9 @@ def _validate(config: CloudSprayConfig) -> None:
             f"spray.lockout_threshold must be >= 1, got {config.spray.lockout_threshold}"
         )
 
-    if config.spray.lockout_pause < 0:
+    if config.spray.lockout_cooldown < 0:
         raise ValueError(
-            f"spray.lockout_pause must be >= 0, got {config.spray.lockout_pause}"
+            f"spray.lockout_cooldown must be >= 0, got {config.spray.lockout_cooldown}"
         )
 
     if config.proxy.azure_aci.container_count < 1:

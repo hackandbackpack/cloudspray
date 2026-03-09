@@ -230,8 +230,8 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
 )
 @click.option("--delay", type=click.IntRange(min=0), default=None, help="Seconds between attempts per user.")
 @click.option("--jitter", type=click.IntRange(min=0), default=None, help="Random jitter range in seconds.")
-@click.option("--lockout-threshold", type=click.IntRange(min=1), default=None, help="Pause after N lockouts.")
-@click.option("--lockout-pause", type=click.IntRange(min=0), default=None, help="Pause duration in seconds on lockout.")
+@click.option("--lockout-threshold", type=click.IntRange(min=1), default=None, help="Hard stop after N consecutive lockouts.")
+@click.option("--lockout-cooldown", type=click.IntRange(min=0), default=None, help="Per-user lockout cooldown in seconds (default 1800).")
 @click.option(
     "--shuffle",
     type=click.Choice(["standard", "aggressive"], case_sensitive=False),
@@ -241,7 +241,7 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
 @click.option("--resume", is_flag=True, default=False, help="Resume from database state.")
 @click.pass_context
 def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
-              lockout_threshold, lockout_pause, shuffle, resume):
+              lockout_threshold, lockout_cooldown, shuffle, resume):
     """Run a password spray against Azure AD."""
     cfg = ctx.obj["config"]
     reporter = ctx.obj["reporter"]
@@ -260,8 +260,8 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
         cfg.spray.jitter = jitter
     if lockout_threshold is not None:
         cfg.spray.lockout_threshold = lockout_threshold
-    if lockout_pause is not None:
-        cfg.spray.lockout_pause = lockout_pause
+    if lockout_cooldown is not None:
+        cfg.spray.lockout_cooldown = lockout_cooldown
     if shuffle is not None:
         cfg.spray.shuffle_mode = shuffle
 
