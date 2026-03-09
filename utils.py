@@ -1,3 +1,18 @@
+"""Shared utility functions used across all CloudSpray modules.
+
+This module provides:
+
+- **Logging setup** -- Configures a ``Rich``-powered console logger with
+  optional file output. Called once at CLI startup.
+- **File I/O helpers** -- Functions to read user lists and password lists
+  from disk, with comment stripping that can be toggled off for password
+  files (where ``#`` is a valid password character).
+- **Email normalization** -- Converts bare usernames to full email addresses
+  by appending the target domain.
+- **Random suffix generation** -- Short random strings for unique naming
+  (used by proxy infrastructure for gateway/container names).
+"""
+
 import logging
 import random
 import string
@@ -7,7 +22,23 @@ from rich.logging import RichHandler
 
 
 def setup_logging(level: str = "INFO", logfile: str | None = None) -> logging.Logger:
-    """Configure structured logging with Rich console output and optional file sink."""
+    """Configure structured logging with Rich console output and optional file sink.
+
+    Creates the root ``cloudspray`` logger with a Rich console handler for
+    colorized, timestamp-prefixed output. If *logfile* is provided, a second
+    handler writes all messages (including DEBUG) to that file for later review.
+
+    On repeated calls (e.g. during tests), the logger level is updated but
+    duplicate handlers are not added.
+
+    Args:
+        level: Logging level string ("DEBUG", "INFO", "WARNING", "ERROR").
+        logfile: Optional path to a log file. When set, all log messages
+            are also written to this file regardless of the console level.
+
+    Returns:
+        The configured ``cloudspray`` logger instance.
+    """
     logger = logging.getLogger("cloudspray")
 
     # Avoid duplicate handlers on repeated calls
@@ -41,17 +72,38 @@ def setup_logging(level: str = "INFO", logfile: str | None = None) -> logging.Lo
 
 
 def random_suffix(length: int = 8) -> str:
-    """Generate a short random alphanumeric string for unique naming."""
+    """Generate a short random alphanumeric string for unique naming.
+
+    Used to create unique identifiers for proxy infrastructure resources
+    (e.g. Fireprox API Gateway names, ACI container names).
+
+    Args:
+        length: Number of characters in the suffix.
+
+    Returns:
+        A lowercase alphanumeric string of the given length.
+    """
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
 def read_lines(filepath: str | Path, *, skip_comments: bool = True) -> list[str]:
     """Read a file and return non-empty, stripped lines.
 
+    This is the base file reader used by both :func:`read_userlist` and
+    :func:`read_password_list`. Each line is stripped of leading/trailing
+    whitespace, and blank lines are always skipped.
+
     Args:
         filepath: Path to the input file.
-        skip_comments: When True, lines starting with '#' are dropped.
-            Set to False for password lists where '#' is a valid character.
+        skip_comments: When ``True``, lines starting with ``#`` are dropped.
+            Set to ``False`` for password lists where ``#`` is a valid
+            password character.
+
+    Returns:
+        List of cleaned, non-empty lines from the file.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
     """
     path = Path(filepath)
     if not path.is_file():
@@ -71,8 +123,15 @@ def read_lines(filepath: str | Path, *, skip_comments: bool = True) -> list[str]
 def normalize_email(username: str, domain: str) -> str:
     """Ensure a username is a fully-qualified email address.
 
-    If the username already contains '@', it is returned as-is.
-    Otherwise, the domain is appended.
+    If the username already contains ``@``, it is returned as-is.
+    Otherwise, ``@domain`` is appended.
+
+    Args:
+        username: A bare username ("jsmith") or full email ("jsmith@contoso.com").
+        domain: The target domain to append if needed.
+
+    Returns:
+        A full email address string.
     """
     if "@" in username:
         return username
@@ -80,13 +139,36 @@ def normalize_email(username: str, domain: str) -> str:
 
 
 def read_userlist(filepath: str | Path) -> list[str]:
-    """Read a list of usernames/emails from a file, one per line."""
+    """Read a list of usernames/emails from a file, one per line.
+
+    Comment lines (starting with ``#``) are skipped so the user can
+    annotate their lists.
+
+    Args:
+        filepath: Path to the user list file.
+
+    Returns:
+        List of username/email strings.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+    """
     return read_lines(filepath)
 
 
 def read_password_list(filepath: str | Path) -> list[str]:
     """Read a list of passwords from a file, one per line.
 
-    Comment stripping is disabled so passwords like '#Summer2024!' are preserved.
+    Comment stripping is disabled so passwords like ``#Summer2024!`` are
+    preserved. Only blank lines are skipped.
+
+    Args:
+        filepath: Path to the password list file.
+
+    Returns:
+        List of password strings.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
     """
     return read_lines(filepath, skip_comments=False)

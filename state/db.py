@@ -1,3 +1,23 @@
+"""SQLite database layer for persisting spray state, results, and tokens.
+
+This module implements ``StateDB``, the central persistence layer that records
+every action CloudSpray takes. The database schema includes:
+
+- **spray_attempts** -- One row per authentication attempt (user + password +
+  client ID + endpoint + result). Used for resume support and audit trails.
+- **valid_credentials** -- Confirmed working username/password pairs with their
+  auth result type (SUCCESS, MFA_REQUIRED, etc.) and discovery timestamp.
+- **tokens** -- OAuth tokens (access, refresh, id) captured from successful
+  logins or FOCI exchanges.
+- **enum_results** -- User existence checks from enumeration methods.
+- **locked_accounts** -- Accounts detected as locked during spraying.
+- **spray_metadata** -- Key/value store for session metadata (e.g. target domain).
+
+All write operations use a thread-locked transaction context manager to ensure
+atomicity and prevent corruption when multiple threads write concurrently.
+The database uses SQLite WAL mode for better concurrent read performance.
+"""
+
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -19,14 +39,34 @@ class StateDB:
 
     Thread-safe and supports resume by tracking every attempt made.
     Can be used as a context manager for automatic cleanup.
+
+    Usage::
+
+        with StateDB("cloudspray.db") as db:
+            db.record_attempt(attempt)
+            pairs = db.get_attempted_pairs()  # for resume
+            creds = db.get_valid_credentials()
+
+    The database file is created automatically if it does not exist.
+    Tables are created on first connection via ``_create_tables()``.
     """
 
     def __init__(self, db_path: str | Path):
+        """Open (or create) the SQLite database at *db_path*.
+
+        Args:
+            db_path: Filesystem path to the SQLite database file.
+                Created automatically if it does not exist.
+        """
         self._conn = sqlite3.connect(
             str(db_path),
+            # Allow the connection to be used from any thread; we manage
+            # thread safety ourselves via self._lock.
             check_same_thread=False,
         )
+        # Use Row factory so columns can be accessed by name (row["username"])
         self._conn.row_factory = sqlite3.Row
+        # WAL mode allows concurrent readers while a writer holds the lock
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._lock = threading.Lock()
         self._create_tables()
@@ -38,6 +78,11 @@ class StateDB:
         self.close()
 
     def _create_tables(self) -> None:
+        """Create all tables if they do not already exist.
+
+        Called once during ``__init__``. Uses ``IF NOT EXISTS`` so it is
+        safe to call on an already-initialized database (for resume).
+        """
         with self._transaction() as cursor:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS spray_attempts (
@@ -102,6 +147,15 @@ class StateDB:
 
     @contextmanager
     def _transaction(self):
+        """Acquire the thread lock, yield a cursor, and commit or rollback.
+
+        All write operations go through this context manager. It ensures
+        that only one thread writes at a time and that failed writes are
+        rolled back cleanly.
+
+        Yields:
+            A ``sqlite3.Cursor`` for executing SQL statements.
+        """
         with self._lock:
             cursor = self._conn.cursor()
             try:
@@ -114,6 +168,15 @@ class StateDB:
     # -- Recording methods --
 
     def record_attempt(self, attempt: SprayAttempt) -> None:
+        """Persist a single spray attempt to the database.
+
+        Every authentication attempt is recorded regardless of outcome.
+        This provides the audit trail and enables resume support via
+        :meth:`get_attempted_pairs`.
+
+        Args:
+            attempt: The spray attempt result to store.
+        """
         with self._transaction() as cursor:
             cursor.execute(
                 """INSERT INTO spray_attempts
@@ -133,6 +196,11 @@ class StateDB:
             )
 
     def record_valid_credential(self, cred: ValidCredential) -> None:
+        """Store a confirmed valid credential (SUCCESS, MFA_REQUIRED, etc.).
+
+        Args:
+            cred: The valid credential to store.
+        """
         with self._transaction() as cursor:
             cursor.execute(
                 """INSERT INTO valid_credentials
@@ -148,6 +216,12 @@ class StateDB:
             )
 
     def store_token(self, token: Token) -> None:
+        """Store an OAuth token set captured from a successful auth flow.
+
+        Args:
+            token: The token to store, including access/refresh/id tokens
+                and metadata about the client ID and resource.
+        """
         with self._transaction() as cursor:
             cursor.execute(
                 """INSERT INTO tokens
@@ -166,6 +240,11 @@ class StateDB:
             )
 
     def record_enum_result(self, result: EnumResult) -> None:
+        """Store a user enumeration result (exists or not).
+
+        Args:
+            result: The enumeration result to store.
+        """
         with self._transaction() as cursor:
             cursor.execute(
                 """INSERT INTO enum_results
@@ -180,6 +259,11 @@ class StateDB:
             )
 
     def record_locked_account(self, locked: LockedAccount) -> None:
+        """Record that an account has been locked out during spraying.
+
+        Args:
+            locked: The locked account record to store.
+        """
         with self._transaction() as cursor:
             cursor.execute(
                 """INSERT INTO locked_accounts
@@ -195,6 +279,11 @@ class StateDB:
     # -- Query methods --
 
     def get_valid_credentials(self) -> list[ValidCredential]:
+        """Return all valid credentials found during spraying.
+
+        Returns:
+            List of ``ValidCredential`` objects, one per confirmed valid login.
+        """
         cursor = self._conn.execute("SELECT * FROM valid_credentials")
         return [
             ValidCredential(
@@ -208,6 +297,11 @@ class StateDB:
         ]
 
     def get_locked_accounts(self) -> list[LockedAccount]:
+        """Return all accounts that were locked during spraying.
+
+        Returns:
+            List of ``LockedAccount`` objects.
+        """
         cursor = self._conn.execute("SELECT * FROM locked_accounts")
         return [
             LockedAccount(
@@ -224,6 +318,11 @@ class StateDB:
         return {(row["username"], row["password"]) for row in cursor.fetchall()}
 
     def get_tokens(self) -> list[Token]:
+        """Return all stored OAuth tokens (both initial and FOCI-exchanged).
+
+        Returns:
+            List of ``Token`` objects including access, refresh, and id tokens.
+        """
         cursor = self._conn.execute("SELECT * FROM tokens")
         return [
             Token(
@@ -244,6 +343,11 @@ class StateDB:
         ]
 
     def get_enum_results(self) -> list[EnumResult]:
+        """Return all user enumeration results.
+
+        Returns:
+            List of ``EnumResult`` objects with existence flags.
+        """
         cursor = self._conn.execute("SELECT * FROM enum_results")
         return [
             EnumResult(
@@ -256,6 +360,16 @@ class StateDB:
         ]
 
     def get_spray_metadata(self, key: str) -> str | None:
+        """Retrieve a metadata value by key from the spray_metadata table.
+
+        Used for session-level data like the target domain.
+
+        Args:
+            key: The metadata key to look up.
+
+        Returns:
+            The value string, or ``None`` if the key does not exist.
+        """
         cursor = self._conn.execute(
             "SELECT value FROM spray_metadata WHERE key = ?", (key,)
         )
@@ -263,6 +377,14 @@ class StateDB:
         return row["value"] if row else None
 
     def set_spray_metadata(self, key: str, value: str) -> None:
+        """Store or update a metadata key/value pair.
+
+        Uses ``INSERT OR REPLACE`` so existing keys are overwritten.
+
+        Args:
+            key: The metadata key.
+            value: The metadata value.
+        """
         with self._transaction() as cursor:
             cursor.execute(
                 "INSERT OR REPLACE INTO spray_metadata (key, value) VALUES (?, ?)",
@@ -270,4 +392,8 @@ class StateDB:
             )
 
     def close(self) -> None:
+        """Close the database connection.
+
+        Called automatically when using ``StateDB`` as a context manager.
+        """
         self._conn.close()

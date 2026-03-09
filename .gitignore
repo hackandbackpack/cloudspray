@@ -1,0 +1,33 @@
+# Secrets and config
+*.yaml
+*.yml
+config.*
+.env
+.env.*
+
+# State and output
+*.db
+*.sqlite
+*.log
+*.csv
+*.json
+valid-users*.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System artifacts
+*.stackdump
