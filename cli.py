@@ -1,3 +1,28 @@
+"""Click-based CLI defining CloudSpray's command structure.
+
+CloudSpray exposes four subcommands under the ``cloudspray`` entry point:
+
+- ``enum``   -- Enumerate valid Azure AD users (OneDrive, Teams, MSOL, Login)
+- ``spray``  -- Password spray against Azure AD with timing/lockout controls
+- ``post``   -- Post-exploitation on valid credentials (FOCI exchange, CA probe, exfil)
+- ``report`` -- Export results from the state database as JSON or CSV
+
+The CLI follows a layered configuration approach:
+
+1. YAML config file (``--config``) is loaded and merged with dataclass defaults
+2. Individual CLI flags (``--delay``, ``--jitter``, etc.) override config values
+3. The resulting config, logger, reporter, and DB path are stored in Click's
+   ``ctx.obj`` dict and passed down to subcommands
+
+All subcommands share the same SQLite database (``--db``) for state persistence
+and resume support. The ``--verbose`` flag enables debug logging and shows
+verbose output (e.g. failed password attempts, not-found users).
+
+Proxy support (Fireprox via AWS API Gateway) is set up in ``_build_fireprox_session``
+when the config enables it. Gateways are created before operations start and
+torn down in a ``finally`` block to avoid leaving orphaned AWS resources.
+"""
+
 import time
 
 import click
@@ -11,13 +36,27 @@ from cloudspray.utils import setup_logging
 
 
 class MutuallyExclusive(click.Option):
-    """Click option that enforces mutual exclusivity with another option."""
+    """Click option subclass that enforces mutual exclusivity with another option.
+
+    Used for ``--passwords`` vs ``--password`` in the spray command -- the user
+    must provide exactly one of them, not both.
+
+    Usage::
+
+        @click.option("-p", "--passwords", cls=MutuallyExclusive,
+                      mutually_exclusive=["password"])
+
+    Args:
+        mutually_exclusive: List of option names that cannot be used alongside
+            this option.
+    """
 
     def __init__(self, *args, **kwargs):
         self.mutually_exclusive = set(kwargs.pop("mutually_exclusive", []))
         super().__init__(*args, **kwargs)
 
     def handle_parse_result(self, ctx, opts, args):
+        """Check for conflicts and raise ``UsageError`` if both options are set."""
         current = self.name in opts and opts[self.name] is not None
         for other_name in self.mutually_exclusive:
             if other_name in opts and opts[other_name] is not None and current:
@@ -50,7 +89,11 @@ class MutuallyExclusive(click.Option):
 )
 @click.pass_context
 def cli(ctx, config, db, verbose):
-    """CloudSpray - Azure AD password sprayer and enumerator."""
+    """CloudSpray - Azure AD password sprayer and enumerator.
+
+    Root command group. Loads config, sets up logging, and stores shared
+    objects in ctx.obj for subcommands to use.
+    """
     ctx.ensure_object(dict)
 
     cfg = load_config(config)
@@ -64,12 +107,17 @@ def cli(ctx, config, db, verbose):
     ctx.obj["reporter"] = ConsoleReporter(verbose=verbose)
 
 
+# Maps enumeration method names to the Microsoft host that handles them.
+# OneDrive is None here because its host is derived from the target domain
+# at runtime (e.g. "contoso-my.sharepoint.com").
 _ENUM_TARGET_HOSTS = {
     "msol": "login.microsoftonline.com",
     "login": "login.microsoftonline.com",
-    "onedrive": None,  # derived from domain: {tenant}-my.sharepoint.com
+    "onedrive": None,
     "teams": "teams.microsoft.com",
 }
+
+# All spray requests go through the main Microsoft login endpoint.
 _SPRAY_TARGET_HOST = "login.microsoftonline.com"
 
 
@@ -80,8 +128,32 @@ def _build_fireprox_session(
 ) -> tuple[ProxyManager | None, FireproxSession | None]:
     """Create a FireproxSession backed by AWS API Gateway, if enabled.
 
-    Returns (proxy_manager, proxy_session). Both are None when the proxy
-    is disabled or target_host is None.
+    Fireprox creates temporary API Gateway endpoints in AWS that proxy
+    HTTPS requests to the target host. Each gateway gets a unique AWS IP,
+    providing IP rotation across spray attempts.
+
+    The function handles the full lifecycle setup:
+    1. Create an AWSGatewayProvider with the configured credentials/regions
+    2. Deploy gateway endpoints targeting the specified host
+    3. Wait for DNS propagation (5s)
+    4. Run a health check to verify gateways are responding
+    5. Return the session for use in spray/enum operations
+
+    The caller is responsible for calling ``proxy_manager.teardown_all()``
+    when done (typically in a ``finally`` block).
+
+    Args:
+        config: Full CloudSpray config with AWS gateway credentials.
+        target_host: The Microsoft host to proxy to (e.g. "login.microsoftonline.com").
+            If ``None``, proxy setup is skipped.
+        reporter: Console reporter for status messages.
+
+    Returns:
+        Tuple of (ProxyManager, FireproxSession). Both are ``None`` when
+        the proxy is disabled or target_host is ``None``.
+
+    Raises:
+        SystemExit: If the health check fails after gateway deployment.
     """
     if not config.proxy.aws_gateway.enabled or target_host is None:
         return None, None
@@ -152,7 +224,7 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
         reporter.error("Teams method requires --teams-user and --teams-pass.")
         raise SystemExit(1)
 
-    from cloudspray.enum import OneDriveEnumerator, TeamsEnumerator, MSOLEnumerator, LoginEnumerator
+    from cloudspray.enumerators import OneDriveEnumerator, TeamsEnumerator, MSOLEnumerator, LoginEnumerator
     from cloudspray.utils import read_userlist
 
     userlist = read_userlist(users)

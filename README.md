@@ -18,7 +18,7 @@ cloudspray/
 ├── cli.py              # Click CLI — entry point for all commands
 ├── config.py           # YAML config with dataclass defaults
 ├── utils.py            # File reading, email normalization, logging
-├── enum/               # User enumeration methods
+├── enumerators/        # User enumeration methods
 │   ├── onedrive.py     # SharePoint personal site probing (403=exists, 404=not)
 │   ├── msol.py         # GetCredentialType API (IfExistsResult field)
 │   ├── teams.py        # Teams user search (requires sacrificial account)

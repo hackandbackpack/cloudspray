@@ -34,16 +34,16 @@ spraying, post-auth) can consume them without re-enumerating.
 
 Typical usage from the CLI layer::
 
-    from cloudspray.enum import OneDriveEnumerator
+    from cloudspray.enumerators import OneDriveEnumerator
 
     enumerator = OneDriveEnumerator(domain, db, reporter)
     valid_users = enumerator.enumerate(candidate_list)
 """
 
-from cloudspray.enum.login import LoginEnumerator
-from cloudspray.enum.msol import MSOLEnumerator
-from cloudspray.enum.onedrive import OneDriveEnumerator
-from cloudspray.enum.teams import TeamsEnumerator
+from cloudspray.enumerators.login import LoginEnumerator
+from cloudspray.enumerators.msol import MSOLEnumerator
+from cloudspray.enumerators.onedrive import OneDriveEnumerator
+from cloudspray.enumerators.teams import TeamsEnumerator
 
 __all__ = [
     "LoginEnumerator",
