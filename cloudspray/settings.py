@@ -1,14 +1,12 @@
-"""Configuration via .env file and CLI flags.
+"""Configuration via config.json and CLI flags.
 
-AWS credentials load from a .env file (or environment variables).
+AWS credentials load from config.json in the repo root.
 Everything else (domain, delay, jitter, etc.) comes from CLI flags.
 """
 
-import os
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
-
-from dotenv import load_dotenv
 
 
 @dataclass
@@ -58,23 +56,24 @@ VALID_SHUFFLE_MODES = {"standard", "aggressive"}
 
 
 def load_config() -> CloudSprayConfig:
-    """Load config from .env file and environment variables.
+    """Load AWS credentials from config.json.
 
-    Looks for .env in the current directory, then the repo root.
-    AWS credentials come from: AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGIONS
+    Looks for config.json in the current directory, then the repo root.
+    If not found, returns defaults (Fireprox disabled).
     """
-    env_path = Path(".env")
-    if not env_path.is_file():
+    config_path = Path("config.json")
+    if not config_path.is_file():
         repo_root = Path(__file__).resolve().parent.parent
-        env_path = repo_root / ".env"
+        config_path = repo_root / "config.json"
 
-    load_dotenv(env_path)
+    if not config_path.is_file():
+        return CloudSprayConfig()
 
-    access_key = os.getenv("AWS_ACCESS_KEY", "")
-    secret_key = os.getenv("AWS_SECRET_KEY", "")
-    regions_str = os.getenv("AWS_REGIONS", "us-east-1,us-west-2,eu-west-1")
-    regions = [r.strip() for r in regions_str.split(",") if r.strip()]
+    data = json.loads(config_path.read_text(encoding="utf-8"))
 
+    access_key = data.get("aws_access_key", "")
+    secret_key = data.get("aws_secret_key", "")
+    regions = data.get("aws_regions", ["us-east-1", "us-west-2", "eu-west-1"])
     enabled = bool(access_key and secret_key)
 
     return CloudSprayConfig(

@@ -16,11 +16,11 @@ All requests can be routed through **AWS API Gateway (Fireprox)** for IP rotatio
 ```
 cloudspray/                  # repo root
 ├── cloudspray.py            # entry point — run this
-├── .env.example             # AWS credentials template
+├── config.json.example      # AWS credentials template
 ├── requirements.txt
 └── cloudspray/              # package
     ├── cli.py               # Click CLI commands
-    ├── settings.py           # Config loading from .env
+    ├── settings.py          # Config loading from config.json
     ├── utils.py             # File I/O, logging, helpers
     ├── enumerators/         # User enumeration methods
     ├── spray/               # Password spray engine
@@ -69,10 +69,10 @@ python3 cloudspray.py spray -d example.com -u valid-users.txt -p passwords.txt
 Set up AWS credentials for IP rotation:
 
 ```bash
-cp .env.example .env
+cp config.json.example config.json
 ```
 
-Edit `.env` and fill in your AWS access key and secret key. Then run normally — CloudSpray automatically detects the credentials and enables Fireprox:
+Edit `config.json` and fill in your AWS access key and secret key. Then run normally — CloudSpray automatically detects the credentials and enables Fireprox:
 
 ```bash
 # Enum through Fireprox
@@ -106,13 +106,13 @@ python3 cloudspray.py report -f csv -o results.csv
 
 AWS credentials are the only file-based config. Everything else is CLI flags.
 
-### AWS Setup (.env)
+### AWS Setup (config.json)
 
 ```bash
-cp .env.example .env
+cp config.json.example config.json
 ```
 
-Fill in your IAM credentials. See `.env.example` for details on required permissions.
+Fill in your IAM credentials. See `config.json.example` for details on required permissions.
 
 ### CLI Flags
 

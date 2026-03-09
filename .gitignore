@@ -1,13 +1,12 @@
 # Secrets
-.env
-!.env.example
+config.json
+!config.json.example
 
 # State and output
 *.db
 *.sqlite
 *.log
 *.csv
-*.json
 valid-users*.txt
 
 # Python
