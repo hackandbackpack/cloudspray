@@ -1,3 +1,28 @@
+"""OAuth token capture and FOCI (Family of Client IDs) refresh token exchange.
+
+After a spray finds credentials with a clean SUCCESS result (no MFA), this
+module uses MSAL's Resource Owner Password Credential (ROPC) flow to
+authenticate and capture a full OAuth token set (access, refresh, and id
+tokens).
+
+The key technique is FOCI exchange: Microsoft's Family of Client IDs program
+means that a refresh token obtained for one FOCI-member application (e.g.
+Microsoft Office) can be exchanged for tokens targeting any other FOCI
+member (Teams, OneDrive, SharePoint, Outlook, etc.). This turns a single
+successful login into access to dozens of Microsoft services.
+
+The exchange process:
+1. Authenticate with the Office client ID via ROPC to get initial tokens
+2. Use the refresh token to call ``acquire_token_by_refresh_token()`` for
+   each FOCI client ID x endpoint combination
+3. If the exchange succeeds, a new access token is minted for that service
+4. The refresh token may rotate during exchange, so each new one is used
+   for subsequent exchanges
+
+All captured tokens are stored in the state database for use by the exfil
+module and for inclusion in reports.
+"""
+
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -10,7 +35,8 @@ from cloudspray.state.models import Token
 
 logger = logging.getLogger(__name__)
 
-# Office client ID used for initial ROPC token capture (FOCI member)
+# Office client ID used for initial ROPC token capture. This is a FOCI member,
+# so its refresh token can be exchanged for tokens to other FOCI apps.
 OFFICE_CLIENT_ID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
 
 
@@ -20,6 +46,11 @@ class TokenManager:
     When spray gets SUCCESS, tokens are captured. FOCI (Family of Client IDs)
     allows exchanging a refresh token obtained with one client ID for tokens
     targeting other FOCI-member applications.
+
+    Args:
+        domain: Target Azure AD domain (e.g. "contoso.com").
+        db: State database for storing captured tokens.
+        reporter: Console reporter for status output.
     """
 
     def __init__(self, domain: str, db: StateDB, reporter: ConsoleReporter):
@@ -168,7 +199,21 @@ class TokenManager:
         resource: str,
         is_foci: bool = False,
     ) -> Token:
-        """Build a Token dataclass from an MSAL result dict."""
+        """Build a Token dataclass from an MSAL result dict.
+
+        Extracts access, refresh, and id tokens from the MSAL response and
+        calculates the expiration time from the ``expires_in`` field.
+
+        Args:
+            msal_result: Raw dict returned by MSAL's token acquisition methods.
+            username: The user the tokens belong to.
+            client_id: The OAuth client ID used for the request.
+            resource: The resource/audience URL the token is scoped to.
+            is_foci: Whether this token was obtained via FOCI exchange.
+
+        Returns:
+            A ``Token`` dataclass ready for database storage.
+        """
         expires_in = msal_result.get("expires_in", 3600)
         if isinstance(expires_in, int):
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)

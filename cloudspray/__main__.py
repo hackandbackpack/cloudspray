@@ -1,8 +1,6 @@
 """Entry point for ``python -m cloudspray``.
 
-This module bootstraps the Click CLI defined in :mod:`cloudspray.cli`.
-If required dependencies (Click, Rich, etc.) are missing, it prints a
-helpful installation message and exits rather than showing a raw traceback.
+Entry point for ``python -m cloudspray``.
 """
 
 try:

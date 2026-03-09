@@ -1,5 +1,18 @@
-# Microsoft resource endpoints used for token requests and API calls.
-# The SharePoint entry is a template — replace {tenant} with the target org.
+"""Microsoft resource endpoint URLs for token requests and API calls.
+
+These are the ``resource`` / ``audience`` URLs passed to Azure AD during
+OAuth token requests. Each endpoint represents a different Microsoft service
+that tokens can be scoped to.
+
+The spray engine uses these to request tokens for specific services, and the
+CA probe module iterates all endpoints combined with all client IDs to find
+conditional access policy gaps (a specific client + endpoint combination
+may bypass MFA or CA restrictions even when others are blocked).
+
+Note: The SharePoint entry uses ``{tenant}`` as a placeholder. At runtime,
+this is replaced with the target organization's tenant slug (e.g.
+``contoso`` from ``contoso.com``).
+"""
 
 ENDPOINTS: dict[str, str] = {
     "Microsoft Graph": "https://graph.microsoft.com",

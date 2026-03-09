@@ -1,33 +1,10 @@
-"""Click-based CLI defining CloudSpray's command structure.
-
-CloudSpray exposes four subcommands under the ``cloudspray`` entry point:
-
-- ``enum``   -- Enumerate valid Azure AD users (OneDrive, Teams, MSOL, Login)
-- ``spray``  -- Password spray against Azure AD with timing/lockout controls
-- ``post``   -- Post-exploitation on valid credentials (FOCI exchange, CA probe, exfil)
-- ``report`` -- Export results from the state database as JSON or CSV
-
-The CLI follows a layered configuration approach:
-
-1. YAML config file (``--config``) is loaded and merged with dataclass defaults
-2. Individual CLI flags (``--delay``, ``--jitter``, etc.) override config values
-3. The resulting config, logger, reporter, and DB path are stored in Click's
-   ``ctx.obj`` dict and passed down to subcommands
-
-All subcommands share the same SQLite database (``--db``) for state persistence
-and resume support. The ``--verbose`` flag enables debug logging and shows
-verbose output (e.g. failed password attempts, not-found users).
-
-Proxy support (Fireprox via AWS API Gateway) is set up in ``_build_fireprox_session``
-when the config enables it. Gateways are created before operations start and
-torn down in a ``finally`` block to avoid leaving orphaned AWS resources.
-"""
+"""Click CLI commands: enum, spray, post, report."""
 
 import time
 
 import click
 
-from cloudspray.config import CloudSprayConfig, load_config
+from cloudspray.settings import CloudSprayConfig, load_config
 from cloudspray.proxy import AWSGatewayProvider, ProxyManager
 from cloudspray.proxy.session import FireproxSession
 from cloudspray.reporting.console import ConsoleReporter
@@ -69,12 +46,6 @@ class MutuallyExclusive(click.Option):
 
 @click.group()
 @click.option(
-    "--config", "-c",
-    type=click.Path(exists=True),
-    default=None,
-    help="Path to YAML config file.",
-)
-@click.option(
     "--db",
     type=click.Path(),
     default="cloudspray.db",
@@ -88,15 +59,14 @@ class MutuallyExclusive(click.Option):
     help="Enable debug logging and verbose output.",
 )
 @click.pass_context
-def cli(ctx, config, db, verbose):
+def cli(ctx, db, verbose):
     """CloudSpray - Azure AD password sprayer and enumerator.
 
-    Root command group. Loads config, sets up logging, and stores shared
-    objects in ctx.obj for subcommands to use.
+    AWS credentials are loaded from .env file. See .env.example.
     """
     ctx.ensure_object(dict)
 
-    cfg = load_config(config)
+    cfg = load_config()
     ctx.obj["config"] = cfg
     ctx.obj["db_path"] = db
     ctx.obj["verbose"] = verbose

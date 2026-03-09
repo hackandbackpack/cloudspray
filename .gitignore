@@ -1,11 +1,6 @@
-# Secrets and config
-*.yaml
-*.yml
-!config.yaml.example
-config.*
-!config.yaml.example
+# Secrets
 .env
-.env.*
+!.env.example
 
 # State and output
 *.db

@@ -1,3 +1,23 @@
+"""Rich-powered console output for live spray and enumeration feedback.
+
+The ``ConsoleReporter`` is the primary user-facing output layer during
+operations. It provides:
+
+- ASCII banner with version information
+- Color-coded single-line results as spray/enum progresses
+- Rich progress bars with ETA for spray operations
+- Summary tables of valid credentials at completion
+- Lockout warnings in bold red
+- Verbose mode that shows failed attempts (normally hidden to reduce noise)
+
+Color coding follows a consistent scheme:
+- **Green** -- SUCCESS (no MFA, clean login)
+- **Bold red** -- MFA_ENROLLMENT (highest-value finding)
+- **Yellow** -- MFA_REQUIRED, CA_BLOCKED, PASSWORD_EXPIRED
+- **Red** -- ACCOUNT_LOCKED, RATE_LIMITED
+- **Dim** -- INVALID_PASSWORD, USER_NOT_FOUND (verbose only)
+"""
+
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -29,7 +49,17 @@ BANNER_ART = r"""
 
 
 class ConsoleReporter:
-    """Rich-powered console output for all CloudSpray modules."""
+    """Rich-powered console output for all CloudSpray modules.
+
+    Instantiated once at CLI startup and passed to all subcommands
+    via ``ctx.obj["reporter"]``.
+
+    Args:
+        verbose: When ``True``, show detailed output including failed
+            password attempts and not-found users. When ``False`` (default),
+            only actionable results (valid creds, lockouts, rate limits)
+            are printed.
+    """
 
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
@@ -44,7 +74,14 @@ class ConsoleReporter:
         )
 
     def start_spray(self, total_attempts: int) -> tuple[Progress, TaskID]:
-        """Create and start a Rich progress bar for spray operations."""
+        """Create and start a Rich progress bar for spray operations.
+
+        Args:
+            total_attempts: Total number of user/password combinations to attempt.
+
+        Returns:
+            Tuple of (Progress, TaskID) for updating the bar during spraying.
+        """
         progress = Progress(
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
@@ -59,11 +96,25 @@ class ConsoleReporter:
         return progress, task_id
 
     def update_progress(self, progress: Progress, task_id: TaskID, advance: int = 1) -> None:
-        """Advance a progress bar task."""
+        """Advance a progress bar task by the given number of steps.
+
+        Args:
+            progress: The Rich Progress instance.
+            task_id: The task to advance.
+            advance: Number of steps to advance (default 1).
+        """
         progress.update(task_id, advance=advance)
 
     def print_result(self, attempt: SprayAttempt) -> None:
-        """Print a color-coded single-line spray result."""
+        """Print a color-coded single-line spray result.
+
+        Actionable results (valid passwords, lockouts, rate limits) are
+        always shown. Failed password attempts and not-found users are
+        only shown in verbose mode.
+
+        Args:
+            attempt: The spray attempt to display.
+        """
         result = attempt.result
         label = f"{attempt.username}:{attempt.password}"
 
@@ -124,7 +175,12 @@ class ConsoleReporter:
         self.console.print(f"[dim][-] {label} - {result.value}[/dim]")
 
     def summary_table(self, valid_creds: list[ValidCredential]) -> None:
-        """Print a Rich table summarizing all valid credentials found."""
+        """Print a Rich table summarizing all valid credentials found.
+
+        Args:
+            valid_creds: List of confirmed valid credentials to display.
+                If empty, prints a "no credentials" message instead.
+        """
         if not valid_creds:
             self.console.print("\n[dim]No valid credentials discovered.[/dim]")
             return
@@ -148,14 +204,27 @@ class ConsoleReporter:
         self.console.print(table)
 
     def lockout_warning(self, count: int) -> None:
-        """Print a bold red lockout threshold warning."""
+        """Print a bold red lockout threshold warning.
+
+        Args:
+            count: Number of accounts that have been locked out.
+        """
         self.console.print(
             f"\n[bold red]WARNING: {count} account(s) locked out! "
             "Pausing spray to avoid further lockouts.[/bold red]\n"
         )
 
     def print_enum_result(self, username: str, exists: bool, method: str) -> None:
-        """Print a color-coded user enumeration result."""
+        """Print a color-coded user enumeration result.
+
+        Valid users are always shown in green. Not-found users are only
+        shown in verbose mode.
+
+        Args:
+            username: The email address that was tested.
+            exists: Whether the user was confirmed to exist.
+            method: The enumeration method used (for display).
+        """
         if exists:
             self.console.print(
                 f"[bold green][+][/bold green] {username} - "
@@ -182,7 +251,14 @@ class ConsoleReporter:
 
     @staticmethod
     def _result_style(result: AuthResult) -> str:
-        """Map an AuthResult to a Rich style string."""
+        """Map an AuthResult to a Rich style string for table formatting.
+
+        Args:
+            result: The auth result to style.
+
+        Returns:
+            Rich style string (e.g. "bold green", "yellow", "dim").
+        """
         style_map = {
             AuthResult.SUCCESS: "bold green",
             AuthResult.VALID_PASSWORD_MFA_ENROLLMENT: "bold red",
