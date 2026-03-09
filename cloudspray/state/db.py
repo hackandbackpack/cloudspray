@@ -317,6 +317,30 @@ class StateDB:
         cursor = self._conn.execute("SELECT username, password FROM spray_attempts")
         return {(row["username"], row["password"]) for row in cursor.fetchall()}
 
+    def get_all_attempts(self) -> list[SprayAttempt]:
+        """Return every spray attempt recorded in the database.
+
+        Returns:
+            List of ``SprayAttempt`` objects ordered by timestamp.
+        """
+        cursor = self._conn.execute(
+            "SELECT * FROM spray_attempts ORDER BY timestamp"
+        )
+        return [
+            SprayAttempt(
+                username=row["username"],
+                password=row["password"],
+                client_id=row["client_id"],
+                endpoint=row["endpoint"],
+                user_agent=row["user_agent"],
+                result=AuthResult(row["result"]),
+                error_code=row["error_code"],
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+                proxy_used=row["proxy_used"],
+            )
+            for row in cursor.fetchall()
+        ]
+
     def get_tokens(self) -> list[Token]:
         """Return all stored OAuth tokens (both initial and FOCI-exchanged).
 
