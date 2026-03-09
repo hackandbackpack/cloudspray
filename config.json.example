@@ -1,0 +1,10 @@
+{
+    "_comment": "CloudSpray AWS Configuration for Fireprox IP Rotation",
+    "_setup": "Copy this file to config.json and fill in your AWS credentials: cp config.json.example config.json",
+    "_permissions": "Your AWS IAM user needs AmazonAPIGatewayAdministrator, or a custom policy with: apigateway:POST, apigateway:GET, apigateway:DELETE",
+    "_note": "If config.json is missing or keys are blank, CloudSpray runs without proxy rotation (all requests from your IP)",
+
+    "aws_access_key": "",
+    "aws_secret_key": "",
+    "aws_regions": ["us-east-1", "us-west-2", "eu-west-1"]
+}

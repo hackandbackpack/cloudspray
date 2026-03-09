@@ -62,7 +62,7 @@ class MutuallyExclusive(click.Option):
 def cli(ctx, db, verbose):
     """CloudSpray - Azure AD password sprayer and enumerator.
 
-    AWS credentials are loaded from .env file. See .env.example.
+    AWS credentials are loaded from config.json. See config.json.example.
     """
     ctx.ensure_object(dict)
 
