@@ -102,35 +102,59 @@ python3 cloudspray.py report -f json -o results.json
 python3 cloudspray.py report -f csv -o results.csv
 ```
 
+## Tenant Discovery
+
+CloudSpray validates that your target domain resolves to a real Azure AD tenant **before** setting up Fireprox gateways or sending any spray/enum requests. If you pass a bare tenant name (no dots), it automatically tries common suffixes:
+
+```
+-d contoso        →  tries contoso, contoso.com, contoso.onmicrosoft.com, contoso.org, contoso.net
+-d contoso.com    →  validates contoso.com directly
+```
+
+On success, it prints the resolved tenant ID so you know you're hitting the right target. On failure, it tells you what it tried and exits — no wasted time or AWS resources.
+
 ## Configuration
 
-AWS credentials are the only file-based config. Everything else is CLI flags.
+All settings can be configured in `config.json` and/or overridden with CLI flags. CLI flags always take priority.
 
-### AWS Setup (config.json)
+### Setup
 
 ```bash
 cp config.json.example config.json
 ```
 
-Fill in your IAM credentials. See `config.json.example` for details on required permissions.
+Edit `config.json` with your settings. See the example file for detailed explanations of every field.
 
-### CLI Flags
+### AWS Credentials (for Fireprox)
 
-Spray settings are all CLI flags with sensible defaults:
+Fill in `aws_access_key` and `aws_secret_key` in `config.json`. If left blank, CloudSpray runs without proxy rotation (all requests from your IP).
+
+### Spray Settings
+
+These can be set in `config.json` as defaults, or overridden per-run with CLI flags:
+
+| Setting | CLI Flag | Default | Description |
+|---------|----------|---------|-------------|
+| `delay` | `--delay` | 30 | Seconds to wait between spray attempts per user. Higher = slower but safer. |
+| `jitter` | `--jitter` | 5 | Random 0 to N seconds added to each delay. Prevents predictable timing patterns. |
+| `shuffle` | `--shuffle` | standard | How user/password pairs are ordered. `standard` groups by password round, `aggressive` fully randomizes all pairs. |
+| `lockout_threshold` | `--lockout-threshold` | 10 | Stop spraying entirely after this many consecutive account lockouts. |
+| `lockout_cooldown` | `--lockout-cooldown` | 1800 | Seconds to skip a locked-out user before retrying them (default 30 minutes). |
+| — | `--resume` | off | Resume from database state, skipping already-attempted pairs. |
+
+### Verbose Mode
+
+Add `-v` to any command to see detailed output:
 
 ```bash
-python3 cloudspray.py spray -d example.com -u users.txt -P 'password' \
-    --delay 60 --jitter 10 --lockout-threshold 5 --lockout-cooldown 3600
+# See every enum result (including NOT FOUND)
+python3 cloudspray.py -v enum -d example.com -u userlist.txt -m msol
+
+# See every spray attempt (including invalid passwords)
+python3 cloudspray.py -v spray -d example.com -u users.txt -P 'password'
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--delay` | 30 | Seconds between attempts per user |
-| `--jitter` | 5 | Random 0-N seconds added to delay |
-| `--lockout-threshold` | 10 | Consecutive lockouts before hard stop |
-| `--lockout-cooldown` | 1800 | Per-user cooldown after lockout (seconds) |
-| `--shuffle` | standard | Pair ordering: "standard" or "aggressive" |
-| `--resume` | off | Resume from database state |
+Without `-v`, only actionable results are shown (valid credentials, lockouts, rate limits).
 
 ## Enumeration Methods
 
@@ -195,6 +219,18 @@ All operations are persisted to a SQLite database (`cloudspray.db` by default). 
 - **Resume after interruption** — The `--resume` flag skips already-attempted credential pairs
 - **Cross-command continuity** — Enum results, spray attempts, valid credentials, and tokens are all stored in one DB
 - **Post-exploitation** — The `post` command reads valid credentials from the DB automatically
+- **Direct queries** — You can inspect raw results anytime with `sqlite3`:
+
+```bash
+# See all spray attempts
+sqlite3 -header -column cloudspray.db "SELECT username, password, result, timestamp FROM spray_attempts ORDER BY timestamp"
+
+# Just the hits (valid passwords, MFA, CA blocked, etc.)
+sqlite3 -header -column cloudspray.db "SELECT * FROM spray_attempts WHERE result NOT IN ('invalid_password', 'user_not_found')"
+
+# Full request details (client ID, endpoint, user-agent, proxy URL)
+sqlite3 -header -column cloudspray.db "SELECT * FROM spray_attempts LIMIT 10"
+```
 
 ## Legal Disclaimer
 
