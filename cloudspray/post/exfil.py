@@ -1,3 +1,25 @@
+"""Lightweight data access demonstration using captured Microsoft Graph tokens.
+
+After tokens are captured (via direct auth or FOCI exchange), this module
+uses them to make authenticated requests to the Microsoft Graph API and
+demonstrate the level of access achieved. This is the "proof of impact"
+step that shows a client what an attacker could access with the compromised
+credentials.
+
+Three data access methods are available:
+
+- **OneDrive** -- Lists root-level files to show document access
+- **Email** -- Reads recent messages to show mailbox access
+- **Teams** -- Enumerates team memberships and channels
+
+All methods use read-only Graph API calls. No data is modified or exfiltrated
+in bulk -- this is designed to demonstrate access scope, not to actually
+steal data.
+
+The module looks up Graph API tokens from the state database, filtering for
+tokens scoped to ``graph.microsoft.com`` that have not yet expired.
+"""
+
 import logging
 from datetime import datetime, timezone
 
@@ -10,12 +32,20 @@ logger = logging.getLogger(__name__)
 
 
 class GraphExfil:
-    """Lightweight data access using captured tokens.
+    """Lightweight data access using captured Microsoft Graph API tokens.
 
-    Uses Microsoft Graph API to demonstrate access:
-    - List OneDrive files
-    - Read recent emails
-    - List Teams conversations
+    Uses read-only Graph API endpoints to demonstrate the impact of
+    compromised credentials. Can be used as a context manager for
+    automatic HTTP session cleanup.
+
+    Usage::
+
+        with GraphExfil(db, reporter) as exfil:
+            results = exfil.run_all("user@contoso.com")
+
+    Args:
+        db: State database containing captured tokens.
+        reporter: Console reporter for status output.
     """
 
     GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -193,7 +223,16 @@ class GraphExfil:
         return results
 
     def run_all(self, username: str) -> dict:
-        """Run all exfil methods for a user. Returns combined results dict."""
+        """Run all data access checks for a user and return combined results.
+
+        Args:
+            username: The email address to check data access for.
+                Must have a valid Graph API token in the database.
+
+        Returns:
+            Dict with keys ``onedrive_files``, ``recent_emails``, and
+            ``teams_conversations``, each containing a list of result dicts.
+        """
         self._reporter.info(f"Running data access checks for {username}")
 
         return {

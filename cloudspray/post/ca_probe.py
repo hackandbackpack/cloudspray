@@ -1,3 +1,23 @@
+"""Conditional Access policy gap detection via brute-force probing.
+
+Conditional Access (CA) policies in Azure AD can restrict sign-ins based on
+the client application, resource endpoint, device platform, location, and
+other signals. However, many organizations only configure CA policies for
+common scenarios (e.g. blocking browser logins) while leaving gaps for
+less-common client/endpoint combinations.
+
+This module tests every combination of Microsoft client ID and resource
+endpoint against credentials that are blocked by MFA or CA policies. If
+any combination returns SUCCESS or MFA_ENROLLMENT instead of the expected
+CA block, that path bypasses the restriction.
+
+The approach is similar to tools like MFASweep: systematically probe the
+CA policy surface to find exploitable gaps.
+
+A random User-Agent is selected for each attempt to reduce fingerprinting,
+and a short delay is added between attempts to avoid Azure AD rate limiting.
+"""
+
 import logging
 import random
 import time
@@ -14,13 +34,14 @@ from cloudspray.state.db import StateDB
 
 logger = logging.getLogger(__name__)
 
-# Results indicating the CA policy did NOT block access
+# Results indicating the CA policy did NOT block access -- these are the
+# outcomes we are looking for during probing.
 BYPASS_RESULTS = {
     AuthResult.SUCCESS,
     AuthResult.VALID_PASSWORD_MFA_ENROLLMENT,
 }
 
-# Delay between probe attempts to avoid rate limiting
+# Delay between probe attempts to stay under Azure AD rate limiting thresholds.
 PROBE_DELAY_SECONDS = 0.5
 
 
@@ -35,6 +56,13 @@ class CAProbe:
     """
 
     def __init__(self, domain: str, db: StateDB, reporter: ConsoleReporter):
+        """Initialize the CA probe.
+
+        Args:
+            domain: Target Azure AD domain (e.g. "contoso.com").
+            db: State database for reading valid credentials.
+            reporter: Console reporter for status and results output.
+        """
         self._domain = domain
         self._authority = f"https://login.microsoftonline.com/{domain}"
         self._db = db

@@ -1,5 +1,18 @@
-# Realistic user agent strings common in corporate environments.
-# Rotating through these helps avoid simple UA-based detection.
+"""Realistic HTTP User-Agent strings for request rotation.
+
+CloudSpray rotates User-Agent headers across spray requests to avoid
+simple detection rules that flag repeated requests from the same UA.
+These strings represent common browsers and Microsoft desktop clients
+seen in real corporate environments.
+
+The spray engine and CA probe module select a random UA from this list
+for each request. This is not a strong evasion technique on its own,
+but it avoids the most basic "same UA from thousands of requests" alerts.
+
+All strings are kept reasonably current (Chrome 120-122, Edge 120-122,
+Firefox 121-123, Safari 17.2) to match what real corporate users would
+send from up-to-date systems.
+"""
 
 USER_AGENTS: list[str] = [
     # Edge on Windows 11

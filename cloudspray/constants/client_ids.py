@@ -1,7 +1,30 @@
-# Microsoft first-party OAuth client IDs
-# FOCI (Family of Client IDs) apps share refresh tokens — a token obtained
-# for one FOCI app can be exchanged for tokens to any other FOCI app.
+"""Microsoft first-party OAuth client IDs for authentication requests.
 
+Every OAuth authentication request to Azure AD requires a ``client_id``
+parameter identifying which application is requesting access. CloudSpray
+uses real Microsoft first-party client IDs to make spray requests appear
+as legitimate sign-in attempts from known Microsoft applications.
+
+The IDs are split into two categories:
+
+**FOCI (Family of Client IDs)** -- These applications participate in
+Microsoft's Family of Client IDs program. The key property is that a
+refresh token obtained for one FOCI app can be exchanged for tokens
+targeting any other FOCI app. This means a single successful login
+can be leveraged to access OneDrive, Teams, Outlook, SharePoint, and
+many other services without re-authenticating.
+
+**Non-FOCI** -- These are also first-party Microsoft apps but do NOT
+share refresh tokens. They are still useful for CA probing because
+conditional access policies may allow certain client IDs while
+blocking others.
+
+``ALL_CLIENT_IDS`` is a combined dict used by the CA probe module to
+test every possible client ID for policy gaps.
+"""
+
+# FOCI apps share refresh tokens -- a token obtained for one FOCI app
+# can be exchanged for tokens to any other FOCI app via the Token Manager.
 FOCI_CLIENT_IDS: dict[str, str] = {
     "Microsoft Office": "d3590ed6-52b3-4102-aeff-aad2292ab01c",
     "Microsoft Teams": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
@@ -31,6 +54,8 @@ FOCI_CLIENT_IDS: dict[str, str] = {
     "Microsoft Authenticator": "4813382a-8fa7-425e-ab75-3b753aab3abb",
 }
 
+# Non-FOCI apps do not share refresh tokens but are useful for CA probing
+# since conditional access policies may treat different client IDs differently.
 NON_FOCI_CLIENT_IDS: dict[str, str] = {
     "Azure Portal": "c44b4083-3bb0-49c1-b47d-974e53cbdf3c",
     "Graph API Explorer": "de8bc8b5-d9f9-48b1-a8ad-b748da725064",
@@ -55,4 +80,6 @@ NON_FOCI_CLIENT_IDS: dict[str, str] = {
     "Microsoft Store": "28b567f6-162c-4f54-99a0-6887f387bbcc",
 }
 
+# Combined dict of all client IDs, used by CA probe to test every possible
+# client/endpoint combination for conditional access policy gaps.
 ALL_CLIENT_IDS: dict[str, str] = {**FOCI_CLIENT_IDS, **NON_FOCI_CLIENT_IDS}

@@ -165,7 +165,12 @@ class ProxyManager:
         )
 
     def teardown_all(self) -> None:
-        """Call teardown() on all registered providers."""
+        """Tear down all registered providers, cleaning up cloud resources.
+
+        Calls teardown() on every provider. Failures are logged but do not
+        prevent teardown of remaining providers -- best-effort cleanup
+        ensures we don't leave resources running when one teardown fails.
+        """
         for provider in self._providers:
             logger.info("Tearing down proxy provider: %s", provider.name)
             try:
@@ -174,13 +179,35 @@ class ProxyManager:
                 logger.exception("Error during teardown of provider: %s", provider.name)
 
     def mark_unhealthy(self, provider_index: int) -> None:
-        """Mark a provider as unhealthy by its index, starting the 5-min cooldown."""
+        """Mark a provider as unhealthy, starting its cooldown timer.
+
+        The provider will be skipped by get_session() until the cooldown
+        period (default 5 minutes) expires, at which point it becomes
+        eligible for selection again.
+
+        Args:
+            provider_index: Zero-based index of the provider in the
+                registration order.
+        """
         self._unhealthy[provider_index] = time.monotonic()
         provider_name = self._providers[provider_index].name
         logger.warning("Marked provider %d (%s) as unhealthy", provider_index, provider_name)
 
     def _is_healthy(self, provider_index: int, provider: ProxyProvider) -> bool:
-        """Check if provider is healthy (not in cooldown or cooldown expired)."""
+        """Check whether a provider is available for use.
+
+        A provider is healthy if it was never marked unhealthy, or if enough
+        time has elapsed since it was marked (cooldown expired). When cooldown
+        expires, the provider is automatically removed from the unhealthy
+        tracking dict and becomes available again.
+
+        Args:
+            provider_index: Zero-based index of the provider.
+            provider: The provider instance (used for logging on recovery).
+
+        Returns:
+            True if the provider is available, False if still in cooldown.
+        """
         unhealthy_since = self._unhealthy.get(provider_index)
         if unhealthy_since is None:
             return True

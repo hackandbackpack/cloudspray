@@ -41,7 +41,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
-from cloudspray.config import CloudSprayConfig
+from cloudspray.settings import CloudSprayConfig
 from cloudspray.constants.error_codes import AuthResult
 from cloudspray.reporting.console import ConsoleReporter
 from cloudspray.spray.auth import Authenticator

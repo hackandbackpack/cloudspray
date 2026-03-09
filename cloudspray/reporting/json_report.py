@@ -1,3 +1,19 @@
+"""JSON report generation from the state database.
+
+Produces a structured JSON file containing the full results of a CloudSpray
+engagement. The report is organized into sections:
+
+- **metadata** -- Timestamp, target domain, tool version
+- **valid_credentials** -- All confirmed valid username/password pairs with
+  exploitability flags (``is_no_mfa``, ``is_mfa_enrollment``)
+- **locked_accounts** -- Accounts that were locked during spraying
+- **tokens** -- OAuth tokens captured (direct auth and FOCI exchange)
+- **statistics** -- Aggregate counts and enumeration results
+
+The JSON report is designed for programmatic consumption by downstream
+tools or for import into reporting platforms.
+"""
+
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,7 +24,11 @@ from cloudspray.state.db import StateDB
 
 
 class JSONReporter:
-    """Export spray results as structured JSON."""
+    """Export spray results as structured JSON.
+
+    Args:
+        db: The state database to read results from.
+    """
 
     def __init__(self, db: StateDB):
         self._db = db
