@@ -8,14 +8,14 @@ operations. It provides:
 - Rich progress bars with ETA for spray operations
 - Summary tables of valid credentials at completion
 - Lockout warnings in bold red
-- Verbose mode that shows failed attempts (normally hidden to reduce noise)
+- Quiet mode (``-q``) that hides per-attempt output, showing only progress and actionable results
 
 Color coding follows a consistent scheme:
 - **Green** -- SUCCESS (no MFA, clean login)
 - **Bold red** -- MFA_ENROLLMENT (highest-value finding)
 - **Yellow** -- MFA_REQUIRED, CA_BLOCKED, PASSWORD_EXPIRED
 - **Red** -- ACCOUNT_LOCKED, RATE_LIMITED
-- **Dim** -- INVALID_PASSWORD, USER_NOT_FOUND (verbose only)
+- **Dim** -- INVALID_PASSWORD, USER_NOT_FOUND (hidden in quiet mode)
 """
 
 from rich.console import Console
@@ -55,10 +55,10 @@ class ConsoleReporter:
     via ``ctx.obj["reporter"]``.
 
     Args:
-        verbose: When ``True``, show detailed output including failed
-            password attempts and not-found users. When ``False`` (default),
-            only actionable results (valid creds, lockouts, rate limits)
-            are printed.
+        verbose: When ``True`` (default), show all results line by line
+            including failed attempts and not-found users. When ``False``
+            (quiet mode), only actionable results (valid creds, lockouts,
+            rate limits) are printed.
     """
 
     def __init__(self, verbose: bool = False):
