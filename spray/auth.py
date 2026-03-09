@@ -43,13 +43,6 @@ class Authenticator:
         scope_resource = scope_resource.replace("{tenant}", tenant_slug)
         scope = [f"{scope_resource}/.default"]
 
-        proxy_url = ""
-        if hasattr(self._http_client, "last_proxy_url"):
-            proxy_url = self._http_client.last_proxy_url
-        else:
-            proxies = self._http_client.proxies or {}
-            proxy_url = proxies.get("https", "")
-
         self._http_client.headers["User-Agent"] = user_agent
 
         if client_id not in self._app_cache:
@@ -68,6 +61,14 @@ class Authenticator:
             )
         except Exception as exc:
             auth_error = exc
+
+        # Read proxy URL after the MSAL call so last_proxy_url reflects this attempt
+        proxy_url = ""
+        if hasattr(self._http_client, "last_proxy_url"):
+            proxy_url = self._http_client.last_proxy_url
+        else:
+            proxies = self._http_client.proxies or {}
+            proxy_url = proxies.get("https", "")
 
         result_enum, error_code = classify_auth_result(auth_result, auth_error)
 

@@ -1,3 +1,5 @@
+import time
+
 import click
 
 from cloudspray.config import CloudSprayConfig, load_config
@@ -94,6 +96,9 @@ def _build_fireprox_session(
     manager = ProxyManager()
     manager.add_provider(provider)
     manager.setup_all(f"https://{target_host}")
+
+    reporter.info("Waiting for gateways to propagate...")
+    time.sleep(5)
 
     if not provider.health_check():
         reporter.error("Fireprox health check failed, tearing down gateways")
