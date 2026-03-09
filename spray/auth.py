@@ -44,8 +44,10 @@ class Authenticator:
         scope = [f"{scope_resource}/.default"]
 
         proxy_url = ""
-        proxies = self._http_client.proxies or {}
-        if proxies:
+        if hasattr(self._http_client, "last_proxy_url"):
+            proxy_url = self._http_client.last_proxy_url
+        else:
+            proxies = self._http_client.proxies or {}
             proxy_url = proxies.get("https", "")
 
         self._http_client.headers["User-Agent"] = user_agent

