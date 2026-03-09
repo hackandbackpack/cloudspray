@@ -55,13 +55,13 @@ class MutuallyExclusive(click.Option):
     help="Path to SQLite state database.",
 )
 @click.option(
-    "--verbose", "-v",
+    "--quiet", "-q",
     is_flag=True,
     default=False,
-    help="Enable debug logging and verbose output.",
+    help="Suppress per-attempt output, show only progress bar and actionable results.",
 )
 @click.pass_context
-def cli(ctx, db, verbose):
+def cli(ctx, db, quiet):
     """CloudSpray - Azure AD password sprayer and enumerator.
 
     AWS credentials are loaded from config.json. See config.json.example.
@@ -71,12 +71,11 @@ def cli(ctx, db, verbose):
     cfg = load_config()
     ctx.obj["config"] = cfg
     ctx.obj["db_path"] = db
-    ctx.obj["verbose"] = verbose
 
-    log_level = "DEBUG" if verbose else "INFO"
+    log_level = "INFO" if quiet else "DEBUG"
     ctx.obj["logger"] = setup_logging(level=log_level)
 
-    ctx.obj["reporter"] = ConsoleReporter(verbose=verbose)
+    ctx.obj["reporter"] = ConsoleReporter(verbose=not quiet)
 
 
 # Maps enumeration method names to the Microsoft host that handles them.
