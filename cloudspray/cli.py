@@ -3,6 +3,7 @@
 import time
 
 import click
+import requests
 
 from cloudspray.settings import CloudSprayConfig, load_config
 from cloudspray.proxy import AWSGatewayProvider, ProxyManager
@@ -89,6 +90,46 @@ _ENUM_TARGET_HOSTS = {
 
 # All spray requests go through the main Microsoft login endpoint.
 _SPRAY_TARGET_HOST = "login.microsoftonline.com"
+
+# Common domain suffixes to try when bare tenant name doesn't resolve.
+_DOMAIN_SUFFIXES = [".com", ".onmicrosoft.com", ".org", ".net"]
+
+
+def _discover_tenant(domain: str, reporter: ConsoleReporter) -> str:
+    """Validate a domain resolves to an Azure AD tenant before proceeding.
+
+    Checks the OpenID Connect discovery endpoint to confirm the tenant exists.
+    If the domain as-is doesn't work, tries appending common suffixes
+    (e.g. "contoso" -> "contoso.com", "contoso.onmicrosoft.com").
+
+    Returns the validated domain string, or raises SystemExit if no valid
+    tenant is found.
+    """
+    oidc_url = "https://login.microsoftonline.com/{}/.well-known/openid-configuration"
+
+    # Try the domain as provided first
+    candidates = [domain]
+
+    # If the domain has no dots, it's probably a bare tenant name — try suffixes
+    if "." not in domain:
+        candidates += [f"{domain}{suffix}" for suffix in _DOMAIN_SUFFIXES]
+
+    for candidate in candidates:
+        try:
+            resp = requests.get(oidc_url.format(candidate), timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                tenant_id = data.get("issuer", "").split("/")[-2] if "issuer" in data else "unknown"
+                reporter.info(f"Tenant found: {candidate} (ID: {tenant_id})")
+                return candidate
+        except requests.RequestException:
+            continue
+
+    # Nothing resolved — show what we tried
+    reporter.error(f"No Azure AD tenant found for '{domain}'")
+    reporter.error(f"Tried: {', '.join(candidates)}")
+    reporter.error("Use a full domain (e.g. contoso.com) or tenant GUID.")
+    raise SystemExit(1)
 
 
 def _build_fireprox_session(
@@ -181,6 +222,9 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
     reporter = ctx.obj["reporter"]
 
     reporter.banner()
+
+    # Validate tenant before doing anything expensive
+    domain = _discover_tenant(domain, reporter)
 
     # Override config with CLI args
     cfg.target.domain = domain
@@ -293,6 +337,9 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
     if not passwords and not password:
         reporter.error("Provide either -p/--passwords (file) or -P/--password (single).")
         raise SystemExit(1)
+
+    # Validate tenant before doing anything expensive
+    domain = _discover_tenant(domain, reporter)
 
     # Override config with CLI args
     cfg.target.domain = domain

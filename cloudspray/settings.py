@@ -76,7 +76,21 @@ def load_config() -> CloudSprayConfig:
     regions = data.get("aws_regions", ["us-east-1", "us-west-2", "eu-west-1"])
     enabled = bool(access_key and secret_key)
 
+    # Spray settings from config.json (CLI flags override these)
+    delay = data.get("delay", 30)
+    jitter = data.get("jitter", 5)
+    shuffle_mode = data.get("shuffle", "standard")
+    lockout_threshold = data.get("lockout_threshold", 10)
+    lockout_cooldown = data.get("lockout_cooldown", 1800)
+
     return CloudSprayConfig(
+        spray=SprayConfig(
+            delay=delay,
+            jitter=jitter,
+            lockout_threshold=lockout_threshold,
+            lockout_cooldown=lockout_cooldown,
+            shuffle_mode=shuffle_mode,
+        ),
         proxy=ProxyConfig(
             aws_gateway=AWSGatewayConfig(
                 enabled=enabled,
@@ -84,5 +98,5 @@ def load_config() -> CloudSprayConfig:
                 secret_key=secret_key,
                 regions=regions,
             )
-        )
+        ),
     )

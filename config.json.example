@@ -1,10 +1,22 @@
 {
-    "_comment": "CloudSpray AWS Configuration for Fireprox IP Rotation",
-    "_setup": "Copy this file to config.json and fill in your AWS credentials: cp config.json.example config.json",
-    "_permissions": "Your AWS IAM user needs AmazonAPIGatewayAdministrator, or a custom policy with: apigateway:POST, apigateway:GET, apigateway:DELETE",
-    "_note": "If config.json is missing or keys are blank, CloudSpray runs without proxy rotation (all requests from your IP)",
+    "_comment": "CloudSpray Configuration",
+    "_setup": "Copy this file to config.json and fill in your values: cp config.json.example config.json",
 
+    "_aws_help": "AWS credentials for Fireprox IP rotation. Leave blank to spray from your own IP.",
+    "_aws_permissions": "IAM user needs AmazonAPIGatewayAdministrator or: apigateway:POST, apigateway:GET, apigateway:DELETE",
     "aws_access_key": "",
     "aws_secret_key": "",
-    "aws_regions": ["us-east-1", "us-west-2", "eu-west-1"]
+    "aws_regions": ["us-east-1", "us-west-2", "eu-west-1"],
+
+    "_spray_help": "Spray timing and safety settings. All values can be overridden by CLI flags.",
+    "_delay_help": "Seconds to wait between spray attempts per user. Higher = slower but safer. (default: 30)",
+    "delay": 30,
+    "_jitter_help": "Random 0 to N seconds added to each delay. Prevents predictable timing patterns. (default: 5)",
+    "jitter": 5,
+    "_shuffle_help": "How user/password pairs are ordered. 'standard' groups by password round, 'aggressive' fully randomizes all pairs. (default: standard)",
+    "shuffle": "standard",
+    "_lockout_threshold_help": "Stop spraying entirely after this many consecutive account lockouts. Prevents cascading lockouts across the tenant. (default: 10)",
+    "lockout_threshold": 10,
+    "_lockout_cooldown_help": "Seconds to skip a user after their account locks out. The user is retried after this cooldown expires. (default: 1800 = 30 minutes)",
+    "lockout_cooldown": 1800
 }
