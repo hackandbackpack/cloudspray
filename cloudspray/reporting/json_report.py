@@ -46,16 +46,28 @@ class JSONReporter:
         valid_creds = self._db.get_valid_credentials()
         locked_accounts = self._db.get_locked_accounts()
         tokens = self._db.get_tokens()
-        attempted_pairs = self._db.get_attempted_pairs()
+        all_attempts = self._db.get_all_attempts()
         enum_results = self._db.get_enum_results()
 
         domain = self._db.get_spray_metadata("domain") or ""
+
+        # Build result breakdown for summary
+        result_counts: dict[str, int] = {}
+        for attempt in all_attempts:
+            key = attempt.result.value
+            result_counts[key] = result_counts.get(key, 0) + 1
 
         report = {
             "metadata": {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "domain": domain,
                 "version": __version__,
+            },
+            "summary": {
+                "total_attempts": len(all_attempts),
+                "valid_credentials": len(valid_creds),
+                "locked_accounts": len(locked_accounts),
+                "results_by_type": result_counts,
             },
             "valid_credentials": [
                 {
@@ -85,19 +97,28 @@ class JSONReporter:
                 }
                 for tok in tokens
             ],
-            "statistics": {
-                "total_attempts": len(attempted_pairs),
-                "valid_count": len(valid_creds),
-                "locked_count": len(locked_accounts),
-                "enum_results": [
-                    {
-                        "username": er.username,
-                        "method": er.method,
-                        "exists": er.exists,
-                    }
-                    for er in enum_results
-                ],
-            },
+            "spray_log": [
+                {
+                    "username": a.username,
+                    "password": a.password,
+                    "result": a.result.value,
+                    "error_code": a.error_code,
+                    "client_id": a.client_id,
+                    "endpoint": a.endpoint,
+                    "user_agent": a.user_agent,
+                    "proxy_used": a.proxy_used,
+                    "timestamp": a.timestamp.isoformat(),
+                }
+                for a in all_attempts
+            ],
+            "enum_results": [
+                {
+                    "username": er.username,
+                    "method": er.method,
+                    "exists": er.exists,
+                }
+                for er in enum_results
+            ],
         }
 
         output = Path(output_path)
