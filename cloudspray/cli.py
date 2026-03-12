@@ -132,6 +132,35 @@ def _discover_tenant(domain: str, reporter: ConsoleReporter) -> str:
     raise SystemExit(1)
 
 
+def _check_federation(domain: str, reporter: ConsoleReporter, force: bool) -> None:
+    """Check if a domain federates to an external IdP and warn/abort."""
+    from cloudspray.recon.discovery import ReconDiscovery
+
+    disco = ReconDiscovery(domain)
+    idp_name, idp_host, fed_url = disco._parse_federation_from_txt()
+
+    if not idp_name:
+        return
+
+    reporter.info("")
+    reporter.error(f"WARNING: {domain} federates authentication to {idp_name} ({idp_host})")
+    reporter.error("Azure AD spray/enum will likely return user_not_found for all federated users.")
+    reporter.info("")
+    reporter.info("Options:")
+    if idp_name == "Okta":
+        reporter.info("  - Use 'okta-spray' command instead")
+    reporter.info("  - Run 'recon' to see full IdP details")
+    reporter.info("  - Pass --force to proceed anyway")
+
+    if not force:
+        reporter.info("")
+        reporter.error("Aborting. Use --force to override.")
+        raise SystemExit(1)
+
+    reporter.info("")
+    reporter.info("--force passed, proceeding despite federation warning.")
+
+
 def _build_fireprox_session(
     config: CloudSprayConfig,
     target_host: str | None,
@@ -215,8 +244,9 @@ def _build_fireprox_session(
 )
 @click.option("--teams-user", default=None, help="Teams auth username (for teams method).")
 @click.option("--teams-pass", default=None, help="Teams auth password (for teams method).")
+@click.option("--force", is_flag=True, default=False, help="Proceed even if domain federates to external IdP.")
 @click.pass_context
-def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
+def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass, force):
     """Enumerate valid Azure AD users."""
     cfg = ctx.obj["config"]
     reporter = ctx.obj["reporter"]
@@ -225,6 +255,8 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
 
     # Validate tenant before doing anything expensive
     domain = _discover_tenant(domain, reporter)
+
+    _check_federation(domain, reporter, force)
 
     # Override config with CLI args
     cfg.target.domain = domain
@@ -325,9 +357,10 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
     help="Shuffle mode for spray ordering.",
 )
 @click.option("--resume", is_flag=True, default=False, help="Resume from database state.")
+@click.option("--force", is_flag=True, default=False, help="Proceed even if domain federates to external IdP.")
 @click.pass_context
 def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
-              lockout_threshold, lockout_cooldown, shuffle, resume):
+              lockout_threshold, lockout_cooldown, shuffle, resume, force):
     """Run a password spray against Azure AD."""
     cfg = ctx.obj["config"]
     reporter = ctx.obj["reporter"]
@@ -340,6 +373,8 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
 
     # Validate tenant before doing anything expensive
     domain = _discover_tenant(domain, reporter)
+
+    _check_federation(domain, reporter, force)
 
     # Override config with CLI args
     cfg.target.domain = domain
