@@ -601,3 +601,62 @@ def format_cmd(ctx, domain, names):
         if proxy_manager is not None:
             reporter.info("Tearing down Fireprox gateways")
             proxy_manager.teardown_all()
+
+
+@cli.command("recon")
+@click.option("-d", "--domain", required=True, help="Target domain to investigate.")
+@click.pass_context
+def recon_cmd(ctx, domain):
+    """Discover the identity provider and tenant info for a domain.
+
+    Checks Azure AD tenant existence, federation status, DNS TXT records
+    for DirectFedAuthUrl, MX records, and autodiscover CNAME. Tells you
+    whether to spray Azure AD or use okta-spray instead.
+    """
+    reporter = ctx.obj["reporter"]
+    reporter.banner()
+
+    from cloudspray.recon import ReconDiscovery
+
+    disco = ReconDiscovery(domain)
+    result = disco.run(reporter)
+
+    reporter.info("")
+    reporter.info("=== Recon Results ===")
+    reporter.info(f"Domain: {result.domain}")
+
+    if result.tenant_id:
+        reporter.info(f"Tenant ID: {result.tenant_id}")
+    else:
+        reporter.info("Tenant: No Azure AD tenant found")
+
+    if result.namespace_type:
+        reporter.info(f"Namespace: {result.namespace_type}")
+    if result.federation_brand:
+        reporter.info(f"Federation Brand: {result.federation_brand}")
+
+    if result.idp_name:
+        reporter.info(f"Identity Provider: {result.idp_name} ({result.idp_host})")
+        if result.federation_url:
+            reporter.info(f"Federation URL: {result.federation_url}")
+    else:
+        reporter.info("Identity Provider: None detected (likely Azure AD native)")
+
+    if result.mail_provider:
+        reporter.info(f"Mail: {result.mail_provider} ({result.mail_host})")
+    if result.autodiscover_cname:
+        reporter.info(f"Autodiscover: {result.autodiscover_cname}")
+        if result.has_m365:
+            reporter.info("M365 Services: In use (autodiscover points to outlook.com)")
+
+    if result.idp_name and result.idp_name != "Unknown":
+        reporter.info("")
+        reporter.error(f"WARNING: This domain federates to {result.idp_name} ({result.idp_host})")
+        reporter.error("Azure AD ROPC spray will likely fail for federated users.")
+        if result.idp_name == "Okta":
+            reporter.info("Use 'okta-spray' command instead.")
+            if result.idp_host:
+                reporter.info(f"  cloudspray.py okta-spray --okta-url https://{result.idp_host} -d {domain} -u users.txt -p passwords.txt")
+        else:
+            reporter.info(f"This IdP ({result.idp_name}) is not yet supported for spraying.")
+            reporter.info("Use --force with spray/enum to attempt anyway.")
