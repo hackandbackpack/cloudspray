@@ -660,3 +660,85 @@ def recon_cmd(ctx, domain):
         else:
             reporter.info(f"This IdP ({result.idp_name}) is not yet supported for spraying.")
             reporter.info("Use --force with spray/enum to attempt anyway.")
+
+
+@cli.command("okta-spray")
+@click.option("-d", "--domain", required=True, help="Target domain (for email normalization).")
+@click.option("-u", "--users", required=True, type=click.Path(exists=True), help="Path to user list file.")
+@click.option("-p", "--passwords", type=click.Path(exists=True), default=None, cls=MutuallyExclusive, mutually_exclusive=["password"], help="Path to password list file.")
+@click.option("-P", "--password", default=None, cls=MutuallyExclusive, mutually_exclusive=["passwords"], help="Single password string.")
+@click.option("--okta-url", default=None, help="Okta org URL (e.g. https://lineage.okta.com). Auto-discovered if omitted.")
+@click.option("--delay", type=click.IntRange(min=0), default=None, help="Seconds between attempts per user (default 60).")
+@click.option("--jitter", type=click.IntRange(min=0), default=None, help="Random jitter range in seconds (default 15).")
+@click.option("--lockout-threshold", type=click.IntRange(min=1), default=None, help="Hard stop after N consecutive lockouts.")
+@click.option("--resume", is_flag=True, default=False, help="Resume from database state.")
+@click.pass_context
+def okta_spray_cmd(ctx, domain, users, passwords, password, okta_url, delay, jitter, lockout_threshold, resume):
+    """Spray passwords against an Okta organization.
+
+    Dedicated Okta sprayer with conservative defaults tuned for Okta's
+    aggressive throttling. Uses the /api/v1/authn endpoint directly.
+
+    The Okta URL is auto-discovered from DNS TXT records if --okta-url
+    is not specified.
+    """
+    cfg = ctx.obj["config"]
+    reporter = ctx.obj["reporter"]
+    reporter.banner()
+
+    if not passwords and not password:
+        reporter.error("Provide either -p/--passwords (file) or -P/--password (single).")
+        raise SystemExit(1)
+
+    # Resolve Okta host
+    okta_host = None
+    if okta_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(okta_url if "://" in okta_url else f"https://{okta_url}")
+        okta_host = parsed.hostname
+    else:
+        reporter.info(f"Auto-discovering Okta URL for {domain}...")
+        from cloudspray.recon import ReconDiscovery
+        disco = ReconDiscovery(domain)
+        _, idp_host, _ = disco._parse_federation_from_txt()
+        if idp_host and "okta.com" in idp_host:
+            okta_host = idp_host
+            reporter.info(f"Found Okta: {okta_host}")
+        else:
+            reporter.error("Could not auto-discover Okta URL from DNS TXT records.")
+            reporter.error("Use --okta-url to specify it directly.")
+            raise SystemExit(1)
+
+    # Okta-tuned defaults
+    cfg.spray.delay = delay if delay is not None else 60
+    cfg.spray.jitter = jitter if jitter is not None else 15
+    if lockout_threshold is not None:
+        cfg.spray.lockout_threshold = lockout_threshold
+    cfg.spray.lockout_cooldown = 1800
+
+    from cloudspray.spray.okta_auth import OktaAuthenticator
+    from cloudspray.spray.engine import SprayEngine
+    from cloudspray.utils import read_userlist, read_password_list, normalize_email
+
+    userlist = [normalize_email(u, domain) for u in read_userlist(users)]
+    passlist = read_password_list(passwords) if passwords else [password]
+
+    proxy_manager, proxy_session = _build_fireprox_session(cfg, okta_host, reporter)
+
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            reporter.info(f"Okta spray starting: {okta_host}")
+            reporter.info(f"User list: {users} ({len(userlist)} entries)")
+            reporter.info(f"Delay={cfg.spray.delay}s, Jitter={cfg.spray.jitter}s (Okta conservative defaults)")
+            authenticator = OktaAuthenticator(okta_host, proxy_session=proxy_session)
+            engine = SprayEngine(cfg, db, authenticator, reporter)
+            engine.run(userlist, passlist, resume=resume)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Okta spray failed: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        if proxy_manager is not None:
+            reporter.info("Tearing down Fireprox gateways")
+            proxy_manager.teardown_all()
