@@ -742,3 +742,61 @@ def okta_spray_cmd(ctx, domain, users, passwords, password, okta_url, delay, jit
         if proxy_manager is not None:
             reporter.info("Tearing down Fireprox gateways")
             proxy_manager.teardown_all()
+
+
+@cli.command("footprint")
+@click.option("-d", "--domain", required=True, help="Target domain to footprint.")
+@click.pass_context
+def footprint_cmd(ctx, domain):
+    """Full DNS-based SaaS intelligence dump for a domain.
+
+    Analyzes TXT, MX, SPF, and DMARC records to identify every SaaS
+    service the organization uses.
+    """
+    reporter = ctx.obj["reporter"]
+    reporter.banner()
+
+    from cloudspray.recon import SaaSFootprinter, ReconDiscovery
+
+    disco = ReconDiscovery(domain)
+    recon_result = disco.run(reporter)
+
+    fp = SaaSFootprinter(domain)
+    result = fp.run(reporter)
+
+    reporter.info("")
+    reporter.info(f"=== Footprint: {domain} ===")
+
+    reporter.info("")
+    reporter.info("--- Mail ---")
+    if result.mail_provider:
+        reporter.info(f"MX: {result.mail_provider} ({result.mail_host})")
+    else:
+        reporter.info("MX: No MX records found")
+    if result.spf_services:
+        reporter.info(f"SPF: {', '.join(result.spf_services)}")
+    if result.spf_includes:
+        for inc in result.spf_includes:
+            reporter.debug(f"  include:{inc}")
+    if result.dmarc_policy:
+        reporter.info(f"DMARC: {result.dmarc_policy}")
+        if result.dmarc_record:
+            reporter.debug(f"  {result.dmarc_record}")
+
+    reporter.info("")
+    reporter.info("--- Identity ---")
+    if recon_result.tenant_id:
+        reporter.info(f"Azure AD: Tenant verified (ID: {recon_result.tenant_id})")
+    else:
+        reporter.info("Azure AD: No tenant found")
+    if recon_result.idp_name:
+        reporter.info(f"IdP: {recon_result.idp_name} ({recon_result.idp_host})")
+    if recon_result.namespace_type:
+        reporter.info(f"Namespace: {recon_result.namespace_type}")
+
+    reporter.info("")
+    reporter.info("--- SaaS Footprint ---")
+    if result.saas_services:
+        reporter.info(", ".join(result.saas_services))
+    else:
+        reporter.info("No SaaS services detected in TXT records")
