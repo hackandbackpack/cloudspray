@@ -804,8 +804,8 @@ def footprint_cmd(ctx, domain):
 
     reporter.info("")
     reporter.info("--- Mail ---")
-    if result.mail_provider:
-        reporter.info(f"MX: {result.mail_provider} ({result.mail_host})")
+    if result.mx_provider:
+        reporter.info(f"MX: {result.mx_provider} ({result.mx_host})")
     else:
         reporter.info("MX: No MX records found")
     if result.spf_services:
@@ -831,7 +831,7 @@ def footprint_cmd(ctx, domain):
 
     reporter.info("")
     reporter.info("--- SaaS Footprint ---")
-    if result.saas_services:
-        reporter.info(", ".join(result.saas_services))
+    if result.txt_services:
+        reporter.info(", ".join(result.txt_services))
     else:
         reporter.info("No SaaS services detected in TXT records")
