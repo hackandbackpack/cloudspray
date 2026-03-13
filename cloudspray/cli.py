@@ -132,6 +132,35 @@ def _discover_tenant(domain: str, reporter: ConsoleReporter) -> str:
     raise SystemExit(1)
 
 
+def _check_federation(domain: str, reporter: ConsoleReporter, force: bool) -> None:
+    """Check if a domain federates to an external IdP and warn/abort."""
+    from cloudspray.recon.discovery import ReconDiscovery
+
+    disco = ReconDiscovery(domain)
+    idp_name, idp_host, fed_url = disco._parse_federation_from_txt()
+
+    if not idp_name:
+        return
+
+    reporter.info("")
+    reporter.error(f"WARNING: {domain} federates authentication to {idp_name} ({idp_host})")
+    reporter.error("Azure AD spray/enum will likely return user_not_found for all federated users.")
+    reporter.info("")
+    reporter.info("Options:")
+    if idp_name == "Okta":
+        reporter.info("  - Use 'okta-spray' command instead")
+    reporter.info("  - Run 'recon' to see full IdP details")
+    reporter.info("  - Pass --force to proceed anyway")
+
+    if not force:
+        reporter.info("")
+        reporter.error("Aborting. Use --force to override.")
+        raise SystemExit(1)
+
+    reporter.info("")
+    reporter.info("--force passed, proceeding despite federation warning.")
+
+
 def _build_fireprox_session(
     config: CloudSprayConfig,
     target_host: str | None,
@@ -215,8 +244,9 @@ def _build_fireprox_session(
 )
 @click.option("--teams-user", default=None, help="Teams auth username (for teams method).")
 @click.option("--teams-pass", default=None, help="Teams auth password (for teams method).")
+@click.option("--force", is_flag=True, default=False, help="Proceed even if domain federates to external IdP.")
 @click.pass_context
-def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
+def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass, force):
     """Enumerate valid Azure AD users."""
     cfg = ctx.obj["config"]
     reporter = ctx.obj["reporter"]
@@ -225,6 +255,8 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
 
     # Validate tenant before doing anything expensive
     domain = _discover_tenant(domain, reporter)
+
+    _check_federation(domain, reporter, force)
 
     # Override config with CLI args
     cfg.target.domain = domain
@@ -325,9 +357,10 @@ def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass):
     help="Shuffle mode for spray ordering.",
 )
 @click.option("--resume", is_flag=True, default=False, help="Resume from database state.")
+@click.option("--force", is_flag=True, default=False, help="Proceed even if domain federates to external IdP.")
 @click.pass_context
 def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
-              lockout_threshold, lockout_cooldown, shuffle, resume):
+              lockout_threshold, lockout_cooldown, shuffle, resume, force):
     """Run a password spray against Azure AD."""
     cfg = ctx.obj["config"]
     reporter = ctx.obj["reporter"]
@@ -340,6 +373,8 @@ def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
 
     # Validate tenant before doing anything expensive
     domain = _discover_tenant(domain, reporter)
+
+    _check_federation(domain, reporter, force)
 
     # Override config with CLI args
     cfg.target.domain = domain
@@ -601,3 +636,202 @@ def format_cmd(ctx, domain, names):
         if proxy_manager is not None:
             reporter.info("Tearing down Fireprox gateways")
             proxy_manager.teardown_all()
+
+
+@cli.command("recon")
+@click.option("-d", "--domain", required=True, help="Target domain to investigate.")
+@click.pass_context
+def recon_cmd(ctx, domain):
+    """Discover the identity provider and tenant info for a domain.
+
+    Checks Azure AD tenant existence, federation status, DNS TXT records
+    for DirectFedAuthUrl, MX records, and autodiscover CNAME. Tells you
+    whether to spray Azure AD or use okta-spray instead.
+    """
+    reporter = ctx.obj["reporter"]
+    reporter.banner()
+
+    from cloudspray.recon import ReconDiscovery
+
+    disco = ReconDiscovery(domain)
+    result = disco.run(reporter)
+
+    reporter.info("")
+    reporter.info("=== Recon Results ===")
+    reporter.info(f"Domain: {result.domain}")
+
+    if result.tenant_id:
+        reporter.info(f"Tenant ID: {result.tenant_id}")
+    else:
+        reporter.info("Tenant: No Azure AD tenant found")
+
+    if result.namespace_type:
+        reporter.info(f"Namespace: {result.namespace_type}")
+    if result.federation_brand:
+        reporter.info(f"Federation Brand: {result.federation_brand}")
+
+    if result.idp_name:
+        reporter.info(f"Identity Provider: {result.idp_name} ({result.idp_host})")
+        if result.federation_url:
+            reporter.info(f"Federation URL: {result.federation_url}")
+    else:
+        reporter.info("Identity Provider: None detected (likely Azure AD native)")
+
+    if result.mail_provider:
+        reporter.info(f"Mail: {result.mail_provider} ({result.mail_host})")
+    if result.autodiscover_cname:
+        reporter.info(f"Autodiscover: {result.autodiscover_cname}")
+        if result.has_m365:
+            reporter.info("M365 Services: In use (autodiscover points to outlook.com)")
+
+    if result.idp_name and result.idp_name != "Unknown":
+        reporter.info("")
+        reporter.error(f"WARNING: This domain federates to {result.idp_name} ({result.idp_host})")
+        reporter.error("Azure AD ROPC spray will likely fail for federated users.")
+        if result.idp_name == "Okta":
+            reporter.info("Use 'okta-spray' command instead.")
+            if result.idp_host:
+                reporter.info(f"  cloudspray.py okta-spray --okta-url https://{result.idp_host} -d {domain} -u users.txt -p passwords.txt")
+        else:
+            reporter.info(f"This IdP ({result.idp_name}) is not yet supported for spraying.")
+            reporter.info("Use --force with spray/enum to attempt anyway.")
+
+
+@cli.command("okta-spray")
+@click.option("-d", "--domain", required=True, help="Target domain (for email normalization).")
+@click.option("-u", "--users", required=True, type=click.Path(exists=True), help="Path to user list file.")
+@click.option("-p", "--passwords", type=click.Path(exists=True), default=None, cls=MutuallyExclusive, mutually_exclusive=["password"], help="Path to password list file.")
+@click.option("-P", "--password", default=None, cls=MutuallyExclusive, mutually_exclusive=["passwords"], help="Single password string.")
+@click.option("--okta-url", default=None, help="Okta org URL (e.g. https://lineage.okta.com). Auto-discovered if omitted.")
+@click.option("--delay", type=click.IntRange(min=0), default=None, help="Seconds between attempts per user (default 60).")
+@click.option("--jitter", type=click.IntRange(min=0), default=None, help="Random jitter range in seconds (default 15).")
+@click.option("--lockout-threshold", type=click.IntRange(min=1), default=None, help="Hard stop after N consecutive lockouts.")
+@click.option("--resume", is_flag=True, default=False, help="Resume from database state.")
+@click.pass_context
+def okta_spray_cmd(ctx, domain, users, passwords, password, okta_url, delay, jitter, lockout_threshold, resume):
+    """Spray passwords against an Okta organization.
+
+    Dedicated Okta sprayer with conservative defaults tuned for Okta's
+    aggressive throttling. Uses the /api/v1/authn endpoint directly.
+
+    The Okta URL is auto-discovered from DNS TXT records if --okta-url
+    is not specified.
+    """
+    cfg = ctx.obj["config"]
+    reporter = ctx.obj["reporter"]
+    reporter.banner()
+
+    if not passwords and not password:
+        reporter.error("Provide either -p/--passwords (file) or -P/--password (single).")
+        raise SystemExit(1)
+
+    # Resolve Okta host
+    okta_host = None
+    if okta_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(okta_url if "://" in okta_url else f"https://{okta_url}")
+        okta_host = parsed.hostname
+    else:
+        reporter.info(f"Auto-discovering Okta URL for {domain}...")
+        from cloudspray.recon import ReconDiscovery
+        disco = ReconDiscovery(domain)
+        _, idp_host, _ = disco._parse_federation_from_txt()
+        if idp_host and "okta.com" in idp_host:
+            okta_host = idp_host
+            reporter.info(f"Found Okta: {okta_host}")
+        else:
+            reporter.error("Could not auto-discover Okta URL from DNS TXT records.")
+            reporter.error("Use --okta-url to specify it directly.")
+            raise SystemExit(1)
+
+    # Okta-tuned defaults
+    cfg.spray.delay = delay if delay is not None else 60
+    cfg.spray.jitter = jitter if jitter is not None else 15
+    if lockout_threshold is not None:
+        cfg.spray.lockout_threshold = lockout_threshold
+    cfg.spray.lockout_cooldown = 1800
+
+    from cloudspray.spray.okta_auth import OktaAuthenticator
+    from cloudspray.spray.engine import SprayEngine
+    from cloudspray.utils import read_userlist, read_password_list, normalize_email
+
+    userlist = [normalize_email(u, domain) for u in read_userlist(users)]
+    passlist = read_password_list(passwords) if passwords else [password]
+
+    proxy_manager, proxy_session = _build_fireprox_session(cfg, okta_host, reporter)
+
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            reporter.info(f"Okta spray starting: {okta_host}")
+            reporter.info(f"User list: {users} ({len(userlist)} entries)")
+            reporter.info(f"Delay={cfg.spray.delay}s, Jitter={cfg.spray.jitter}s (Okta conservative defaults)")
+            authenticator = OktaAuthenticator(okta_host, proxy_session=proxy_session)
+            engine = SprayEngine(cfg, db, authenticator, reporter)
+            engine.run(userlist, passlist, resume=resume)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Okta spray failed: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        if proxy_manager is not None:
+            reporter.info("Tearing down Fireprox gateways")
+            proxy_manager.teardown_all()
+
+
+@cli.command("footprint")
+@click.option("-d", "--domain", required=True, help="Target domain to footprint.")
+@click.pass_context
+def footprint_cmd(ctx, domain):
+    """Full DNS-based SaaS intelligence dump for a domain.
+
+    Analyzes TXT, MX, SPF, and DMARC records to identify every SaaS
+    service the organization uses.
+    """
+    reporter = ctx.obj["reporter"]
+    reporter.banner()
+
+    from cloudspray.recon import SaaSFootprinter, ReconDiscovery
+
+    disco = ReconDiscovery(domain)
+    recon_result = disco.run(reporter)
+
+    fp = SaaSFootprinter(domain)
+    result = fp.run(reporter)
+
+    reporter.info("")
+    reporter.info(f"=== Footprint: {domain} ===")
+
+    reporter.info("")
+    reporter.info("--- Mail ---")
+    if result.mx_provider:
+        reporter.info(f"MX: {result.mx_provider} ({result.mx_host})")
+    else:
+        reporter.info("MX: No MX records found")
+    if result.spf_services:
+        reporter.info(f"SPF: {', '.join(result.spf_services)}")
+    if result.spf_includes:
+        for inc in result.spf_includes:
+            reporter.debug(f"  include:{inc}")
+    if result.dmarc_policy:
+        reporter.info(f"DMARC: {result.dmarc_policy}")
+        if result.dmarc_record:
+            reporter.debug(f"  {result.dmarc_record}")
+
+    reporter.info("")
+    reporter.info("--- Identity ---")
+    if recon_result.tenant_id:
+        reporter.info(f"Azure AD: Tenant verified (ID: {recon_result.tenant_id})")
+    else:
+        reporter.info("Azure AD: No tenant found")
+    if recon_result.idp_name:
+        reporter.info(f"IdP: {recon_result.idp_name} ({recon_result.idp_host})")
+    if recon_result.namespace_type:
+        reporter.info(f"Namespace: {recon_result.namespace_type}")
+
+    reporter.info("")
+    reporter.info("--- SaaS Footprint ---")
+    if result.txt_services:
+        reporter.info(", ".join(result.txt_services))
+    else:
+        reporter.info("No SaaS services detected in TXT records")
