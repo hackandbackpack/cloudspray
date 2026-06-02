@@ -1,0 +1,271 @@
+"""Rich-powered console output for live spray and enumeration feedback.
+
+The ``ConsoleReporter`` is the primary user-facing output layer during
+operations. It provides:
+
+- ASCII banner with version information
+- Color-coded single-line results as spray/enum progresses
+- Rich progress bars with ETA for spray operations
+- Summary tables of valid credentials at completion
+- Lockout warnings in bold red
+- Quiet mode (``-q``) that hides per-attempt output, showing only progress and actionable results
+
+Color coding follows a consistent scheme:
+- **Green** -- SUCCESS (no MFA, clean login)
+- **Bold red** -- MFA_ENROLLMENT (highest-value finding)
+- **Yellow** -- MFA_REQUIRED, CA_BLOCKED, PASSWORD_EXPIRED
+- **Red** -- ACCOUNT_LOCKED, RATE_LIMITED
+- **Dim** -- INVALID_PASSWORD, USER_NOT_FOUND (hidden in quiet mode)
+"""
+
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
+from rich.text import Text
+
+from cloudspray import __version__
+from cloudspray.constants.error_codes import AuthResult
+from cloudspray.state.models import SprayAttempt, ValidCredential
+
+BANNER_ART = r"""
+   _____ _                 _  _____
+  / ____| |               | |/ ____|
+ | |    | | ___  _   _  __| | (___  _ __  _ __ __ _ _   _
+ | |    | |/ _ \| | | |/ _` |\___ \| '_ \| '__/ _` | | | |
+ | |____| | (_) | |_| | (_| |____) | |_) | | | (_| | |_| |
+  \_____|_|\___/ \__,_|\__,_|_____/| .__/|_|  \__,_|\__, |
+                                   | |                __/ |
+                                   |_|               |___/
+"""
+
+
+class ConsoleReporter:
+    """Rich-powered console output for all CloudSpray modules.
+
+    Instantiated once at CLI startup and passed to all subcommands
+    via ``ctx.obj["reporter"]``.
+
+    Args:
+        verbose: When ``True`` (default), show all results line by line
+            including failed attempts and not-found users. When ``False``
+            (quiet mode), only actionable results (valid creds, lockouts,
+            rate limits) are printed.
+    """
+
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self.console = Console()
+
+    def banner(self) -> None:
+        """Print the CloudSpray ASCII banner with version."""
+        self.console.print(Text(BANNER_ART, style="bold cyan"))
+        self.console.print(
+            f"  [bold white]v{__version__}[/bold white]  |  "
+            "[dim]Azure AD Password Sprayer & Enumerator[/dim]\n"
+        )
+
+    def start_spray(self, total_attempts: int) -> tuple[Progress, TaskID]:
+        """Create and start a Rich progress bar for spray operations.
+
+        Args:
+            total_attempts: Total number of user/password combinations to attempt.
+
+        Returns:
+            Tuple of (Progress, TaskID) for updating the bar during spraying.
+        """
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=self.console,
+        )
+        progress.start()
+        task_id = progress.add_task("Spraying...", total=total_attempts)
+        return progress, task_id
+
+    def update_progress(self, progress: Progress, task_id: TaskID, advance: int = 1) -> None:
+        """Advance a progress bar task by the given number of steps.
+
+        Args:
+            progress: The Rich Progress instance.
+            task_id: The task to advance.
+            advance: Number of steps to advance (default 1).
+        """
+        progress.update(task_id, advance=advance)
+
+    def print_result(self, attempt: SprayAttempt) -> None:
+        """Print a color-coded single-line spray result.
+
+        Actionable results (valid passwords, lockouts, rate limits) are
+        always shown. Failed password attempts and not-found users are
+        only shown in verbose mode.
+
+        Args:
+            attempt: The spray attempt to display.
+        """
+        result = attempt.result
+        label = f"{attempt.username}:{attempt.password}"
+
+        if result == AuthResult.SUCCESS:
+            self.console.print(f"[bold green][+][/bold green] {label} - [green]SUCCESS[/green]")
+            return
+
+        if result == AuthResult.VALID_PASSWORD_MFA_ENROLLMENT:
+            self.console.print(
+                f"[bold red][!!][/bold red] {label} - "
+                "[bold red]MFA ENROLLMENT REQUIRED (50079)[/bold red]"
+            )
+            return
+
+        if result == AuthResult.VALID_PASSWORD_MFA_REQUIRED:
+            self.console.print(
+                f"[yellow][!][/yellow] {label} - [yellow]MFA Required[/yellow]"
+            )
+            return
+
+        if result == AuthResult.VALID_PASSWORD_CA_BLOCKED:
+            self.console.print(
+                f"[yellow][!][/yellow] {label} - [yellow]CA Policy Blocked[/yellow]"
+            )
+            return
+
+        if result == AuthResult.VALID_PASSWORD_EXPIRED:
+            self.console.print(
+                f"[yellow][!][/yellow] {label} - [yellow]Password Expired[/yellow]"
+            )
+            return
+
+        if result == AuthResult.ACCOUNT_LOCKED:
+            self.console.print(
+                f"[bold red][LOCKED][/bold red] {label} - [red]Account Locked[/red]"
+            )
+            return
+
+        if result == AuthResult.RATE_LIMITED:
+            self.console.print(
+                f"[bold red][RATE][/bold red] {label} - [red]Rate Limited[/red]"
+            )
+            return
+
+        # Verbose-only results
+        if not self.verbose:
+            return
+
+        if result == AuthResult.INVALID_PASSWORD:
+            self.console.print(f"[dim][-] {label} - Invalid Password[/dim]")
+            return
+
+        if result in (AuthResult.ACCOUNT_DISABLED, AuthResult.USER_NOT_FOUND):
+            self.console.print(f"[dim][-] {label} - {result.value}[/dim]")
+            return
+
+        # Catch-all for unknown results
+        self.console.print(f"[dim][-] {label} - {result.value}[/dim]")
+
+    def summary_table(self, valid_creds: list[ValidCredential]) -> None:
+        """Print a Rich table summarizing all valid credentials found.
+
+        Args:
+            valid_creds: List of confirmed valid credentials to display.
+                If empty, prints a "no credentials" message instead.
+        """
+        if not valid_creds:
+            self.console.print("\n[dim]No valid credentials discovered.[/dim]")
+            return
+
+        table = Table(title="Valid Credentials", show_lines=True)
+        table.add_column("Username", style="cyan", no_wrap=True)
+        table.add_column("Password", style="white")
+        table.add_column("Result", style="yellow")
+        table.add_column("MFA Type", style="magenta")
+
+        for cred in valid_creds:
+            result_style = self._result_style(cred.result)
+            table.add_row(
+                cred.username,
+                cred.password,
+                Text(cred.result.value, style=result_style),
+                cred.mfa_type or "N/A",
+            )
+
+        self.console.print()
+        self.console.print(table)
+
+    def lockout_warning(self, count: int) -> None:
+        """Print a bold red lockout threshold warning.
+
+        Args:
+            count: Number of accounts that have been locked out.
+        """
+        self.console.print(
+            f"\n[bold red]WARNING: {count} account(s) locked out! "
+            "Pausing spray to avoid further lockouts.[/bold red]\n"
+        )
+
+    def print_enum_result(self, username: str, exists: bool, method: str) -> None:
+        """Print a color-coded user enumeration result.
+
+        Valid users are always shown in green. Not-found users are only
+        shown in verbose mode.
+
+        Args:
+            username: The email address that was tested.
+            exists: Whether the user was confirmed to exist.
+            method: The enumeration method used (for display).
+        """
+        if exists:
+            self.console.print(
+                f"[bold green][+][/bold green] {username} - "
+                f"[green]VALID[/green] [dim]({method})[/dim]"
+            )
+        elif self.verbose:
+            self.console.print(
+                f"[dim][-] {username} - NOT FOUND ({method})[/dim]"
+            )
+
+    def error(self, message: str) -> None:
+        """Print a red error message."""
+        self.console.print(f"[bold red]Error:[/bold red] {message}")
+
+    def info(self, message: str) -> None:
+        """Print an info message."""
+        self.console.print(f"[bold blue]>[/bold blue] {message}")
+
+    def debug(self, message: str) -> None:
+        """Print a debug message (only in verbose mode)."""
+        if not self.verbose:
+            return
+        self.console.print(f"[dim]  {message}[/dim]")
+
+    @staticmethod
+    def _result_style(result: AuthResult) -> str:
+        """Map an AuthResult to a Rich style string for table formatting.
+
+        Args:
+            result: The auth result to style.
+
+        Returns:
+            Rich style string (e.g. "bold green", "yellow", "dim").
+        """
+        style_map = {
+            AuthResult.SUCCESS: "bold green",
+            AuthResult.VALID_PASSWORD_MFA_ENROLLMENT: "bold red",
+            AuthResult.VALID_PASSWORD_MFA_REQUIRED: "yellow",
+            AuthResult.VALID_PASSWORD_CA_BLOCKED: "yellow",
+            AuthResult.VALID_PASSWORD_EXPIRED: "yellow",
+            AuthResult.ACCOUNT_LOCKED: "red",
+            AuthResult.RATE_LIMITED: "red",
+        }
+        return style_map.get(result, "dim")

