@@ -60,7 +60,12 @@ class FireproxSession(requests.Session):
             useful for debugging and logging.
     """
 
-    def __init__(self, provider: ProxyProvider, target_host: str) -> None:
+    def __init__(
+        self,
+        provider: ProxyProvider,
+        target_host: str,
+        forwarded_for: str | None = None,
+    ) -> None:
         """Initialize the session with a proxy provider and target host.
 
         Args:
@@ -70,13 +75,20 @@ class FireproxSession(requests.Session):
                 (e.g., "login.microsoftonline.com"). Any request URL
                 containing this hostname will be rewritten to go through
                 the proxy.
+            forwarded_for: Value to send in ``X-My-X-Forwarded-For`` on
+                proxied requests. Defaults to the provider's configured value
+                when it exposes one, otherwise empty. See the note below on
+                why this header matters.
         """
         super().__init__()
         self.provider = provider
         self.target_host = target_host
+        if forwarded_for is None:
+            forwarded_for = getattr(provider, "forwarded_for", "")
+        self.forwarded_for = forwarded_for
         self.last_proxy_url: str = ""
 
-    def _rewrite_url(self, url: str) -> str:
+    def _rewrite_url(self, url: str) -> tuple[str, bool]:
         """Rewrite a URL to route through the proxy gateway if it targets our host.
 
         Checks both https:// and http:// schemes so that plain-HTTP URLs
@@ -87,16 +99,16 @@ class FireproxSession(requests.Session):
             url: The original request URL.
 
         Returns:
-            The rewritten URL if it matched the target host, or the
-            original URL unchanged.
+            ``(url, rewritten)`` where ``rewritten`` reports whether the URL
+            matched the target host and was sent through the gateway.
         """
         for scheme in ("https://", "http://"):
             prefix = f"{scheme}{self.target_host}"
             if url.startswith(prefix):
                 gateway_url = self.provider.get_proxy_url().rstrip("/")
                 self.last_proxy_url = gateway_url
-                return url.replace(prefix, gateway_url, 1)
-        return url
+                return url.replace(prefix, gateway_url, 1), True
+        return url, False
 
     def request(self, method, url, **kwargs):
         """Override the base request method to rewrite URLs before sending.
@@ -104,6 +116,12 @@ class FireproxSession(requests.Session):
         If the request URL targets the configured host (over either HTTP or
         HTTPS), the scheme + host prefix is replaced with the next gateway
         URL from the provider. URLs that don't match pass through unchanged.
+
+        Proxied requests also carry ``X-My-X-Forwarded-For``. The gateway is
+        configured to map that header onto X-Forwarded-For, replacing the value
+        API Gateway would otherwise populate with our real source IP. Without
+        sending it, the mapping has nothing to substitute and the operator's
+        address can reach the target in a header.
 
         Args:
             method: HTTP method (GET, POST, etc.).
@@ -113,5 +131,10 @@ class FireproxSession(requests.Session):
         Returns:
             requests.Response from the (possibly rewritten) request.
         """
-        url = self._rewrite_url(url)
+        url, rewritten = self._rewrite_url(url)
+        if rewritten:
+            # Copy rather than mutate: callers (and MSAL) reuse header dicts.
+            headers = dict(kwargs.get("headers") or {})
+            headers.setdefault("X-My-X-Forwarded-For", self.forwarded_for)
+            kwargs["headers"] = headers
         return super().request(method, url, **kwargs)

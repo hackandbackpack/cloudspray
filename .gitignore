@@ -7,7 +7,21 @@ config.json
 *.sqlite
 *.log
 *.csv
+
+# JSON reports carry usernames, results, tokens, and plaintext passwords when
+# --no-redact is used. Ignore all JSON except the checked-in config template.
+*.json
+!config.json.example
+
+# Engagement input and output lists: target emails, employee names, passwords.
 valid-users*.txt
+users*.txt
+userlist*.txt
+emails*.txt
+names*.txt
+passwords*.txt
+passlist*.txt
+targets*.txt
 
 # Python
 __pycache__/

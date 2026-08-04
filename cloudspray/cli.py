@@ -168,6 +168,29 @@ def _check_federation(domain: str, reporter: ConsoleReporter, force: bool) -> No
     reporter.info("--force passed, proceeding despite federation warning.")
 
 
+def _warn_no_rotation(reporter: ConsoleReporter, reason: str) -> None:
+    """Tell the operator, unmissably, that traffic will leave from their own IP.
+
+    Rotation is the intended default for every spray and enum run. Falling back
+    to a direct connection is occasionally deliberate but should never be
+    something you discover afterwards from the target's logs.
+
+    Args:
+        reporter: Console reporter for output.
+        reason: Why rotation is not active, phrased for the operator.
+    """
+    reporter.warning(reason)
+    reporter.warning(
+        "Requests will originate from THIS host's public IP. Attempts will be "
+        "attributable to you, and IP-based lockout or blocking will hit your "
+        "address directly."
+    )
+    reporter.warning(
+        "To rotate: add AWS credentials to config.json (Fireprox) or pass "
+        "--proxy-backend aws|azure."
+    )
+
+
 def _build_proxy_session(
     config: CloudSprayConfig,
     target_host: str | None,
@@ -201,7 +224,17 @@ def _build_proxy_session(
     """
     backend = backend.lower()
 
-    if backend == "none" or target_host is None:
+    if backend == "none":
+        _warn_no_rotation(
+            reporter,
+            "--proxy-backend none was requested, so no IP rotation is in place.",
+        )
+        return None, None
+
+    if target_host is None:
+        _warn_no_rotation(
+            reporter, "No proxy target host was resolved for this operation."
+        )
         return None, None
 
     aws_enabled = config.proxy.aws_gateway.enabled
@@ -227,6 +260,13 @@ def _build_proxy_session(
         elif azure_enabled:
             use_azure = True
         else:
+            # The easiest way to spray from your own IP by accident: no
+            # credentials in config.json and no explicit backend choice.
+            _warn_no_rotation(
+                reporter,
+                "No AWS or Azure credentials are configured in config.json, "
+                "so 'auto' found no proxy backend to use.",
+            )
             return None, None
 
     if use_aws:
@@ -249,7 +289,17 @@ def _build_proxy_session(
             manager.teardown_all()
             raise SystemExit(1)
 
-        reporter.info(f"Fireprox ready: {len(provider._gateway_urls)} gateway(s) active")
+        if provider.failed_regions:
+            reporter.warning(
+                f"Gateway creation failed in {len(provider.failed_regions)} "
+                f"region(s): {', '.join(provider.failed_regions)}. "
+                "IP diversity is lower than configured."
+            )
+
+        reporter.info(
+            f"Fireprox ready: {provider.gateway_count} gateway(s) active, "
+            f"rotating per request"
+        )
         session = FireproxSession(provider, target_host)
         return manager, session
 

@@ -39,6 +39,18 @@ from cloudspray.utils import random_suffix
 
 logger = logging.getLogger(__name__)
 
+# API Gateway inserts its own X-Forwarded-For containing the caller's real IP.
+# Declaring a client-supplied header and mapping it over the top is how the
+# Fireprox technique keeps the operator's address out of the forwarded request.
+FORWARDED_FOR_HEADER = "X-My-X-Forwarded-For"
+FORWARDED_FOR_METHOD_PARAM = f"method.request.header.{FORWARDED_FOR_HEADER}"
+FORWARDED_FOR_INTEGRATION_PARAM = "integration.request.header.X-Forwarded-For"
+
+# API Gateway stamps this header on responses it generates itself (throttling,
+# missing auth token, bad configuration). Its presence proves the request never
+# reached the backend, which is what distinguishes a live proxy from a broken one.
+_APIGW_ERROR_HEADER = "x-amzn-ErrorType"
+
 
 def _require_boto3():
     """Lazy-import boto3, raising a clear error if it is not installed.
@@ -87,7 +99,13 @@ class AWSGatewayProvider(ProxyProvider):
         _round_robin_index: Counter for cycling through gateway URLs.
     """
 
-    def __init__(self, access_key: str, secret_key: str, regions: list[str]):
+    def __init__(
+        self,
+        access_key: str,
+        secret_key: str,
+        regions: list[str],
+        forwarded_for: str = "",
+    ):
         """Initialize the provider with AWS credentials and target regions.
 
         Args:
@@ -96,17 +114,38 @@ class AWSGatewayProvider(ProxyProvider):
             regions: List of AWS region slugs to create gateways in
                 (e.g., ["us-east-1", "us-west-2", "eu-west-1"]). More
                 regions means greater IP diversity but slower setup.
+            forwarded_for: Value sent in ``X-My-X-Forwarded-For``, which the
+                gateway maps over the X-Forwarded-For it would otherwise fill
+                with the operator's real IP. Empty (the default) suppresses the
+                address without claiming to be some unrelated third party.
         """
         self._access_key = access_key
         self._secret_key = secret_key
         self._regions = regions
+        self._forwarded_for = forwarded_for
         self._gateway_urls: list[str] = []
         self._api_ids: list[tuple[str, str]] = []  # (region, api_id) for teardown
         self._round_robin_index = 0
+        self._failed_regions: list[str] = []
 
     @property
     def name(self) -> str:
         return "aws-api-gateway"
+
+    @property
+    def gateway_count(self) -> int:
+        """Number of gateways that were created successfully."""
+        return len(self._gateway_urls)
+
+    @property
+    def failed_regions(self) -> list[str]:
+        """Regions where gateway creation failed, for operator visibility."""
+        return list(self._failed_regions)
+
+    @property
+    def forwarded_for(self) -> str:
+        """Value the session should send in ``X-My-X-Forwarded-For``."""
+        return self._forwarded_for
 
     def setup(self, target_url: str) -> None:
         """Create REST API Gateways in each configured region.
@@ -175,13 +214,17 @@ class AWSGatewayProvider(ProxyProvider):
 
                 # Step 4: Create an ANY method (accepts all HTTP methods) with
                 # no authorization. The requestParameters declaration tells
-                # API Gateway that {proxy} is a path parameter.
+                # API Gateway that {proxy} is a path parameter, and that we
+                # may supply X-My-X-Forwarded-For (see step 5 for why).
                 client.put_method(
                     restApiId=api_id,
                     resourceId=resource_id,
                     httpMethod="ANY",
                     authorizationType="NONE",
-                    requestParameters={"method.request.path.proxy": True},
+                    requestParameters={
+                        "method.request.path.proxy": True,
+                        FORWARDED_FOR_METHOD_PARAM: False,
+                    },
                 )
 
                 # Step 5: Configure HTTP_PROXY integration. This tells API
@@ -189,6 +232,13 @@ class AWSGatewayProvider(ProxyProvider):
                 # {proxy} is replaced with whatever path the client sent.
                 # For example, a request to <gateway>/proxy/common/oauth2/token
                 # gets forwarded to login.microsoftonline.com/common/oauth2/token.
+                #
+                # The X-Forwarded-For mapping is the part that actually makes
+                # this anonymous. Left alone, API Gateway appends the caller's
+                # real source IP to X-Forwarded-For before handing the request
+                # to the backend, so the target sees straight through the proxy
+                # even though the TCP connection comes from AWS. Overriding it
+                # from a client-supplied header means we control the value.
                 integration_uri = f"{target_url}/{{proxy}}"
                 client.put_integration(
                     restApiId=api_id,
@@ -198,11 +248,35 @@ class AWSGatewayProvider(ProxyProvider):
                     integrationHttpMethod="ANY",
                     uri=integration_uri,
                     requestParameters={
-                        "integration.request.path.proxy": "method.request.path.proxy"
+                        "integration.request.path.proxy": "method.request.path.proxy",
+                        FORWARDED_FOR_INTEGRATION_PARAM: FORWARDED_FOR_METHOD_PARAM,
                     },
                 )
 
-                # Step 6: Deploy to a stage called "proxy". The stage name
+                # Step 6: Proxy the root path too. Without a method on "/", a
+                # request to the bare invoke URL is answered by API Gateway
+                # itself rather than the backend, which makes it impossible to
+                # tell a working gateway from a misconfigured one.
+                client.put_method(
+                    restApiId=api_id,
+                    resourceId=root_id,
+                    httpMethod="ANY",
+                    authorizationType="NONE",
+                    requestParameters={FORWARDED_FOR_METHOD_PARAM: False},
+                )
+                client.put_integration(
+                    restApiId=api_id,
+                    resourceId=root_id,
+                    httpMethod="ANY",
+                    type="HTTP_PROXY",
+                    integrationHttpMethod="ANY",
+                    uri=target_url,
+                    requestParameters={
+                        FORWARDED_FOR_INTEGRATION_PARAM: FORWARDED_FOR_METHOD_PARAM,
+                    },
+                )
+
+                # Step 7: Deploy to a stage called "proxy". The stage name
                 # becomes part of the invoke URL path.
                 client.create_deployment(restApiId=api_id, stageName="proxy")
 
@@ -213,6 +287,9 @@ class AWSGatewayProvider(ProxyProvider):
                 logger.info("Created API Gateway %s in %s", api_id, region)
 
             except Exception:
+                # Recorded so the caller can tell the operator that IP diversity
+                # is lower than they asked for instead of failing silently.
+                self._failed_regions.append(region)
                 logger.exception("Failed to create API Gateway in %s", region)
 
         if not self._gateway_urls:
@@ -270,33 +347,47 @@ class AWSGatewayProvider(ProxyProvider):
         self._round_robin_index = 0
 
     def health_check(self) -> bool:
-        """Verify all gateways are reachable by sending a GET to each invoke URL.
+        """Verify every gateway actually forwards to the backend.
 
-        A gateway is considered healthy if it returns any HTTP status below 500.
-        Status codes like 403 or 404 are expected when hitting the base invoke
-        URL without a valid path -- they still prove the gateway itself is
-        accepting connections and forwarding to the backend.
+        Checking only for "status < 500" is not enough: API Gateway answers a
+        request it cannot route with its own 403, so a gateway whose integration
+        is misconfigured looks identical to a working one. This sends a request
+        through the proxy and rejects any response that API Gateway generated
+        itself, identified by the ``x-amzn-ErrorType`` header.
 
         Returns:
-            True if all gateways respond with status < 500, False if any
-            gateway is unreachable or returns a server error.
+            True only if every gateway returned a response that came from the
+            backend. False if any gateway is unreachable, returns a server
+            error, or answers from API Gateway itself.
         """
         if not self._gateway_urls:
             return False
 
         for url in self._gateway_urls:
             try:
-                resp = requests.get(url, timeout=10)
-                # 200-499 range means the gateway itself is reachable;
-                # 403 is common when no valid path is hit, still means the
-                # gateway is alive.
-                if resp.status_code >= 500:
-                    logger.warning(
-                        "Gateway unhealthy (HTTP %d): %s", resp.status_code, url
-                    )
-                    return False
+                resp = requests.get(
+                    f"{url}/",
+                    timeout=10,
+                    allow_redirects=False,
+                    headers={FORWARDED_FOR_HEADER: self._forwarded_for},
+                )
             except requests.RequestException:
                 logger.warning("Gateway unreachable: %s", url)
+                return False
+
+            if resp.status_code >= 500:
+                logger.warning("Gateway unhealthy (HTTP %d): %s", resp.status_code, url)
+                return False
+
+            # A response from API Gateway itself never touched the backend, so
+            # the integration is wrong no matter how benign the status looks.
+            if _APIGW_ERROR_HEADER in resp.headers:
+                logger.warning(
+                    "Gateway did not reach the backend (%s: %s): %s",
+                    _APIGW_ERROR_HEADER,
+                    resp.headers[_APIGW_ERROR_HEADER],
+                    url,
+                )
                 return False
 
         return True

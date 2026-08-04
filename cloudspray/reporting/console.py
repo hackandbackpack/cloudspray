@@ -239,6 +239,10 @@ class ConsoleReporter:
         """Print a red error message."""
         self.console.print(f"[bold red]Error:[/bold red] {message}")
 
+    def warning(self, message: str) -> None:
+        """Print a yellow warning message."""
+        self.console.print(f"[bold yellow]Warning:[/bold yellow] {message}")
+
     def info(self, message: str) -> None:
         """Print an info message."""
         self.console.print(f"[bold blue]>[/bold blue] {message}")

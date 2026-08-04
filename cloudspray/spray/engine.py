@@ -40,6 +40,7 @@ import random
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from math import ceil
 
 from cloudspray.settings import CloudSprayConfig
 from cloudspray.constants.error_codes import AuthResult
@@ -62,6 +63,19 @@ _VALID_PASSWORD_RESULTS = {
 
 # How long to sleep when Azure AD returns a rate-limit (AADSTS50196) response.
 RATE_LIMIT_SLEEP_SECONDS = 60
+
+# How many times a pair may be deferred for lockout cooldown before it is given
+# up on. Bounds the wait-retry-relock cycle for an account that keeps locking,
+# which would otherwise loop for as long as the campaign runs.
+MAX_LOCKOUT_DEFERRALS = 2
+
+# Longest the engine will sit idle waiting for a lockout cooldown to expire.
+# Waiting out a short cooldown saves a pointless re-run, but the cooldown
+# defaults to 1800s and is operator-configurable, so blocking for the full
+# window would hang the tool for half an hour with no output. Past this ceiling
+# the run ends and reports exactly which pairs still need attempting, which is
+# what --resume exists for.
+MAX_COOLDOWN_WAIT_SECONDS = 120
 
 
 class SprayEngine:
@@ -108,6 +122,9 @@ class SprayEngine:
         self._confirmed_users: set[str] = set()
         self._locked_users: dict[str, datetime] = {}
         self._consecutive_lockouts = 0
+        # Live count of pairs still expected to be attempted, used to keep the
+        # progress total honest as pairs drop out of the workload.
+        self._remaining = 0
 
     def run(self, users: list[str], passwords: list[str], resume: bool = True) -> None:
         """Execute the full spray campaign.
@@ -160,106 +177,216 @@ class SprayEngine:
         )
 
         progress, task_id = self._reporter.start_spray(remaining)
+        self._remaining = remaining
         queue: deque[tuple[str, str]] = deque(pairs)
-        # Pairs deferred because the user was in lockout cooldown. These are
-        # retried after the main queue is exhausted and cooldowns have expired.
-        skipped: list[tuple[str, str]] = []
+        # Pairs put off because their user is in lockout cooldown, with a count
+        # of how many cooldown cycles each has already waited through.
+        deferred: list[tuple[str, str]] = []
+        deferral_counts: dict[tuple[str, str], int] = {}
+        abandoned: list[tuple[str, str]] = []
+        tripped = False
+        wait_rounds = 0
 
         try:
-            while queue:
-                username, password = queue.popleft()
-
-                # No point testing more passwords once we have a valid one.
-                if username in self._confirmed_users:
-                    remaining -= 1
-                    progress.update(task_id, total=remaining)
-                    continue
-
-                # Defer pairs for locked users -- they will be retried later.
-                if self._is_locked(username):
-                    skipped.append((username, password))
-                    remaining -= 1
-                    progress.update(task_id, total=remaining)
-                    continue
-
-                # Block until the per-user delay window has elapsed.
-                self._enforce_user_delay(username)
-
-                attempt = self._auth.attempt(username, password)
-                self._last_attempt_per_user[username] = attempt.timestamp
-                self._reporter.print_result(attempt)
-
-                self._handle_result(attempt)
-
-                # Rate-limited attempts are not recorded (they did not produce
-                # a real auth result) and are re-queued after a sleep.
-                if attempt.result != AuthResult.RATE_LIMITED:
-                    self._db.record_attempt(attempt)
-                    self._reporter.update_progress(progress, task_id)
-                else:
-                    self._reporter.info(
-                        f"Rate limited on {attempt.username}, "
-                        f"sleeping {RATE_LIMIT_SLEEP_SECONDS}s then retrying..."
-                    )
-                    time.sleep(RATE_LIMIT_SLEEP_SECONDS)
-                    queue.append((attempt.username, attempt.password))
-
-                # Circuit breaker: too many consecutive lockouts means the
-                # spray is causing damage and must stop immediately.
-                if self._consecutive_lockouts >= self._config.spray.lockout_threshold:
-                    self._reporter.lockout_warning(self._consecutive_lockouts)
-                    self._reporter.error(
-                        f"{self._consecutive_lockouts} consecutive lockouts — "
-                        "stopping spray to protect accounts."
-                    )
+            while queue or deferred:
+                tripped = self._drain(
+                    queue, deferred, deferral_counts, abandoned, progress, task_id
+                )
+                if tripped or not deferred:
                     break
 
-            # Re-queue skipped users whose cooldown has expired
-            if skipped and self._consecutive_lockouts < self._config.spray.lockout_threshold:
-                ready = [(u, p) for u, p in skipped if not self._is_locked(u)]
-                still_locked = [(u, p) for u, p in skipped if self._is_locked(u)]
-
+                ready = [pair for pair in deferred if not self._is_locked(pair[0])]
                 if ready:
+                    deferred = [pair for pair in deferred if self._is_locked(pair[0])]
                     self._reporter.info(
-                        f"{len(ready)} previously locked user(s) ready for retry"
+                        f"{len({user for user, _ in ready})} user(s) out of lockout "
+                        "cooldown, retrying"
                     )
                     queue.extend(ready)
+                    continue
 
-                if still_locked:
-                    cooldown = self._config.spray.lockout_cooldown
-                    locked_names = {u for u, _ in still_locked}
-                    self._reporter.info(
-                        f"{len(locked_names)} user(s) still in lockout cooldown "
-                        f"({cooldown}s): {', '.join(sorted(locked_names))}"
-                    )
+                # Everything left is still cooling down. Wait it out if that is
+                # quick, otherwise stop and say what was left rather than either
+                # dropping the work silently or hanging for the full window.
+                wait = self._seconds_until_next_unlock(deferred)
+                if not wait or wait > MAX_COOLDOWN_WAIT_SECONDS:
+                    break
 
-                # Process the re-queued pairs that have exited cooldown.
-                while queue:
-                    username, password = queue.popleft()
+                # Bounded so a clock that does not advance as expected cannot
+                # turn this into a spin loop.
+                if wait_rounds >= MAX_LOCKOUT_DEFERRALS:
+                    break
+                wait_rounds += 1
 
-                    if username in self._confirmed_users:
-                        continue
-
-                    if self._is_locked(username):
-                        continue
-
-                    self._enforce_user_delay(username)
-
-                    attempt = self._auth.attempt(username, password)
-                    self._last_attempt_per_user[username] = attempt.timestamp
-                    self._reporter.print_result(attempt)
-
-                    self._handle_result(attempt)
-
-                    if attempt.result != AuthResult.RATE_LIMITED:
-                        self._db.record_attempt(attempt)
-                        self._reporter.update_progress(progress, task_id)
-
+                # Floored: a sub-second remainder would otherwise produce a
+                # stream of near-zero sleeps and duplicate log lines.
+                wait = max(1.0, wait)
+                locked_names = sorted({user for user, _ in deferred})
+                self._reporter.info(
+                    f"All {len(deferred)} remaining pair(s) are in lockout cooldown. "
+                    f"Waiting {ceil(wait)}s for the next account to clear "
+                    f"({len(locked_names)} user(s): {', '.join(locked_names)})"
+                )
+                time.sleep(wait)
         finally:
             progress.stop()
 
+        self._report_unfinished(abandoned, deferred, tripped)
+
         valid_creds = self._db.get_valid_credentials()
         self._reporter.summary_table(valid_creds)
+
+    def _drain(
+        self,
+        queue: deque[tuple[str, str]],
+        deferred: list[tuple[str, str]],
+        deferral_counts: dict[tuple[str, str], int],
+        abandoned: list[tuple[str, str]],
+        progress,
+        task_id,
+    ) -> bool:
+        """Process the queue until it empties or the circuit breaker trips.
+
+        This is the single place a credential pair is ever attempted. Keeping it
+        in one method is deliberate: the previous implementation had a second,
+        trimmed-down copy of this loop for lockout retries that was missing the
+        circuit breaker and the rate-limit re-queue, so the safety mechanisms
+        silently did not apply to retried pairs.
+
+        Args:
+            queue: Pairs waiting to be attempted. Rate-limited pairs are pushed
+                back onto it.
+            deferred: Collects pairs whose user is in lockout cooldown.
+            deferral_counts: Tracks how many times each pair has been deferred.
+            abandoned: Collects pairs given up on after too many deferrals.
+            progress: Live progress display.
+            task_id: Progress task identifier.
+
+        Returns:
+            ``True`` if the circuit breaker tripped and the campaign must stop.
+        """
+        while queue:
+            username, password = queue.popleft()
+            pair = (username, password)
+
+            # No point testing more passwords once we have a valid one.
+            if username in self._confirmed_users:
+                self._drop_pair(progress, task_id)
+                continue
+
+            if self._is_locked(username):
+                count = deferral_counts.get(pair, 0) + 1
+                deferral_counts[pair] = count
+                if count > MAX_LOCKOUT_DEFERRALS:
+                    abandoned.append(pair)
+                    self._drop_pair(progress, task_id)
+                else:
+                    deferred.append(pair)
+                continue
+
+            # Block until the per-user delay window has elapsed.
+            self._enforce_user_delay(username)
+
+            attempt = self._auth.attempt(username, password)
+            self._last_attempt_per_user[username] = attempt.timestamp
+            self._reporter.print_result(attempt)
+
+            self._handle_result(attempt)
+
+            # Rate-limited attempts are not recorded (they did not produce a
+            # real auth result) and are re-queued after a sleep.
+            if attempt.result == AuthResult.RATE_LIMITED:
+                self._reporter.info(
+                    f"Rate limited on {attempt.username}, "
+                    f"sleeping {RATE_LIMIT_SLEEP_SECONDS}s then retrying..."
+                )
+                time.sleep(RATE_LIMIT_SLEEP_SECONDS)
+                queue.append(pair)
+            else:
+                self._db.record_attempt(attempt)
+                self._reporter.update_progress(progress, task_id)
+
+            # Circuit breaker: too many consecutive lockouts means the spray is
+            # causing damage and must stop immediately.
+            if self._consecutive_lockouts >= self._config.spray.lockout_threshold:
+                self._reporter.lockout_warning(self._consecutive_lockouts)
+                self._reporter.error(
+                    f"{self._consecutive_lockouts} consecutive lockouts — "
+                    "stopping spray to protect accounts."
+                )
+                return True
+
+        return False
+
+    def _drop_pair(self, progress, task_id) -> None:
+        """Shrink the progress total for a pair that left the workload for good.
+
+        Only called for pairs that will never be attempted (user already
+        confirmed, or abandoned after repeated lockouts). Deferred pairs keep
+        their slot in the total, since they are postponed rather than dropped.
+        """
+        self._remaining -= 1
+        progress.update(task_id, total=self._remaining)
+
+    def _seconds_until_next_unlock(
+        self, pairs: list[tuple[str, str]]
+    ) -> float | None:
+        """Seconds until the earliest still-locked user among pairs clears.
+
+        Args:
+            pairs: Pairs currently deferred for lockout cooldown.
+
+        Returns:
+            Seconds to wait, or ``None`` when nothing is actually locked.
+        """
+        cooldown = timedelta(seconds=self._config.spray.lockout_cooldown)
+        now = datetime.now(timezone.utc)
+        waits = []
+
+        for username, _ in pairs:
+            locked_at = self._locked_users.get(username)
+            if locked_at is None:
+                return None
+            seconds_left = (locked_at + cooldown - now).total_seconds()
+            if seconds_left <= 0:
+                return None
+            waits.append(seconds_left)
+
+        return min(waits) if waits else None
+
+    def _report_unfinished(
+        self,
+        abandoned: list[tuple[str, str]],
+        deferred: list[tuple[str, str]],
+        tripped: bool,
+    ) -> None:
+        """Account for every pair that was not attempted.
+
+        Silence here is the real hazard: an operator who believes a user list
+        was fully sprayed will not re-run it, and a locked or queued account
+        that was never tested looks identical to one with no valid password.
+        """
+        if abandoned:
+            names = sorted({user for user, _ in abandoned})
+            self._reporter.warning(
+                f"{len(abandoned)} pair(s) across {len(names)} user(s) were NOT "
+                f"attempted: their accounts stayed locked through "
+                f"{MAX_LOCKOUT_DEFERRALS} cooldown cycles ({', '.join(names)}). "
+                "Re-run with --resume once those accounts unlock."
+            )
+
+        if deferred:
+            names = sorted({user for user, _ in deferred})
+            cause = (
+                "when the circuit breaker stopped the spray"
+                if tripped
+                else "in lockout cooldown when the run ended"
+            )
+            self._reporter.warning(
+                f"{len(deferred)} pair(s) across {len(names)} user(s) were NOT "
+                f"attempted, still {cause} ({', '.join(names)}). Re-run with "
+                "--resume to continue."
+            )
 
     def _build_pairs(
         self, users: list[str], passwords: list[str]
